@@ -317,6 +317,38 @@ When using ASE models, the following extra keyword arguments to `createSystem()`
 | `aseAtoms` | An Atoms object to use for computations. |
 | `info` | Values that should be added to the `info` dict of the Atoms object. |
 
+### Metatomic
+
+The [metatomic](https://docs.metatensor.org/metatomic/) interface runs exported
+TorchScript models (`.pt` files). The full engine documentation and examples live in the
+[metatomic OpenMM engine page](https://docs.metatensor.org/metatomic/latest/engines/openmm.html).
+
+The following model names are supported.
+
+| Name | Model |
+| --- | --- |
+| `metatomic` | Custom exported models specified with the `modelPath` argument |
+
+When creating metatomic models, the following keyword arguments to the `MLPotential` constructor are supported.
+
+| Argument | Description |
+| --- | --- |
+| `modelPath` | The path to the exported model file |
+| `device` | The PyTorch device to perform calculations on, either a `torch.device` object or a string (such as `'cuda'` or `'cpu'`.)  If omitted, a device is chosen from the model's supported devices. |
+| `extensionsDirectory` | Directory containing compiled TorchScript extensions required by the model, if any |
+| `checkConsistency` | If `True`, run metatomic consistency checks during evaluation.  The default is `False`. |
+
+When using metatomic models, the following extra keyword arguments to `createSystem()` and `createMixedSystem()` are supported.
+
+| Argument | Description |
+| --- | --- |
+| `charge` | The total charge of the system.  If omitted, it is assumed to be 0.  Used only if the model requests a charge input. |
+| `multiplicity` | The spin multiplicity of the system.  If omitted, it is assumed to be 1.  Used only if the model requests a spin multiplicity input. |
+| `info` | Dict of extra inputs (`charge`, `spin_multiplicity`) matching the ASE calculator convention. |
+
+Metatomic models can also be used through the ASE backend with
+[`MetatomicCalculator`](https://docs.metatensor.org/metatomic/latest/engines/ase.html).
+
 ### Other Packages
 
 OpenMM-ML is based on a plugin architecture, allowing other packages to provide their own interfaces to it.  The
