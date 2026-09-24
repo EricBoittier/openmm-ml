@@ -266,19 +266,19 @@ class TestMetatomicPotential:
             _export_harmonic(path, positions, all_numbers)
             mm_system = prmtop.createSystem(nonbondedMethod=app.PME)
             potential = MLPotential("metatomic", modelPath=path, device="cpu")
+            # Finite interaction_range => getMLLongRange() is False; no need to pass
+            # mlLongRange. An explicit value remains allowed as an override.
             mixed_system = potential.createMixedSystem(
                 prmtop.topology,
                 mm_system,
                 ml_atoms,
                 interpolate=False,
-                mlLongRange=False,
             )
             interp_system = potential.createMixedSystem(
                 prmtop.topology,
                 mm_system,
                 ml_atoms,
                 interpolate=True,
-                mlLongRange=False,
             )
             platform = mm.Platform.getPlatform(platform_int)
             mm_context = mm.Context(mm_system, mm.VerletIntegrator(0.001), platform)
@@ -523,3 +523,65 @@ class TestMetatomicPotentialOptions:
         potential = MLPotential("metatomic", modelPath=model_path, device="cpu")
         with pytest.raises(ValueError, match="length-3"):
             potential.createSystem(pdb.topology, pbc=(True, False))
+
+    def testGetMLLongRangeFromInteractionRange(self, harmonic_toluene):
+        from openmmml.models.metatomicpotential import MetatomicPotentialImpl
+
+        _, numbers, positions, _ = harmonic_toluene
+        with tempfile.TemporaryDirectory() as tmp:
+            short_path = os.path.join(tmp, "short.pt")
+            long_path = os.path.join(tmp, "long.pt")
+            _export_model(
+                short_path,
+                HarmonicModel(1.0, torch.tensor(positions, dtype=torch.float64)),
+                numbers,
+                interaction_range=0.5,
+            )
+            _export_model(
+                long_path,
+                HarmonicModel(1.0, torch.tensor(positions, dtype=torch.float64)),
+                numbers,
+                interaction_range=float("inf"),
+            )
+            short = MetatomicPotentialImpl(
+                "metatomic", short_path, "cpu", None, False
+            )
+            long = MetatomicPotentialImpl(
+                "metatomic", long_path, "cpu", None, False
+            )
+            assert short.getMLLongRange() is False
+            assert long.getMLLongRange() is True
+
+    def testMLLongRangeOverride(self, harmonic_toluene):
+        from openmmml.models.metatomicpotential import MetatomicPotentialImpl
+
+        _, numbers, positions, _ = harmonic_toluene
+        prmtop = app.AmberPrmtopFile(
+            os.path.join(test_data_dir, "toluene", "toluene-explicit.prm7")
+        )
+        ml_atoms = list(range(15))
+        all_numbers = [
+            atom.element.atomic_number for atom in prmtop.topology.atoms()
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            # Model reports long-range; override to short-range for embedding.
+            path = os.path.join(tmp, "long-override.pt")
+            _export_model(
+                path,
+                HarmonicModel(1.0, torch.tensor(positions, dtype=torch.float64)),
+                all_numbers,
+                interaction_range=float("inf"),
+            )
+            mm_system = prmtop.createSystem(nonbondedMethod=app.PME)
+            potential = MLPotential("metatomic", modelPath=path, device="cpu")
+            impl = MetatomicPotentialImpl(
+                "metatomic", path, "cpu", None, False
+            )
+            assert impl.getMLLongRange() is True
+            mixed = potential.createMixedSystem(
+                prmtop.topology,
+                mm_system,
+                ml_atoms,
+                mlLongRange=False,
+            )
+            assert mixed is not None

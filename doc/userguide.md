@@ -385,10 +385,10 @@ When using metatomic models, the following extra keyword arguments to `createSys
 | `atomTypes` | A list of integers giving the metatomic atom type for each atom in the Topology.  If omitted, each atom's element atomic number is used.  Required when any atom lacks an element, or when the model uses types that are not elements (for example separate types for O and Ow). |
 | `pbc` | Length-3 sequence of booleans for periodic boundary conditions along each box vector.  If omitted, all three directions follow the topology / System (all periodic or all non-periodic). |
 
-For periodic mixed ML/MM systems with mechanical embedding, pass `mlLongRange` to
-`createMixedSystem()` as described in the Mechanical Embedding section below.  That
-option is part of OpenMM-ML's embedding API (whether the model already includes
-periodic images of the ML subset), not a metatomic-specific keyword.
+For periodic mixed ML/MM systems with mechanical embedding, whether the model is
+treated as long-range is inferred from its metatomic `interaction_range`
+(`True` when infinite, `False` otherwise).  Pass `mlLongRange` to
+`createMixedSystem()` to override that choice if needed.
 
 ## Embeddings
 
@@ -412,12 +412,17 @@ OpenMM-ML calls these models "long-range".  Other MLIPs may compute only the int
 periodic image.  In this case, the interaction between the ML subset and all of its other periodic images is computed
 using the MM force field when using mechanical embedding.
 
-For the pretrained models supported by OpenMM-ML, this behavior is selected automatically.  However, for custom models
-(*e.g.*, the ASE, DeePMD, metatomic, and NequIP interfaces, and non-pretrained FeNNix, MACE, and TorchMDNet models) it is necessary
-to specify which behavior your model uses when doing mechanical embedding in a periodic system.  To do so, pass
-`mlLongRange=False` to `createMixedSystem()` if your model is not long-range, and `mlLongRange=True` if it is.  An error
-will be raised to inform you if this information is needed and not provided; OpenMM-ML will not assume either choice
-automatically.
+For the pretrained models supported by OpenMM-ML, this behavior is selected automatically.
+The metatomic interface also selects it automatically from the model's
+`interaction_range` (infinite means long-range).  For other custom models
+(*e.g.*, the ASE, DeePMD, and NequIP interfaces, and non-pretrained FeNNix, MACE,
+and TorchMDNet models) it is necessary to specify which behavior your model uses
+when doing mechanical embedding in a periodic system.  To do so, pass
+`mlLongRange=False` to `createMixedSystem()` if your model is not long-range, and
+`mlLongRange=True` if it is.  An error will be raised to inform you if this
+information is needed and not provided; OpenMM-ML will not assume either choice
+automatically.  Passing `mlLongRange` also overrides an automatically determined
+value when you need to correct it.
 
 #### Molecules Spanning the ML-MM Region
 

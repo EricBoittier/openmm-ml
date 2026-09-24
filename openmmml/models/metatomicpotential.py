@@ -28,6 +28,7 @@ OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 
+import math
 import warnings
 from typing import Iterable, Optional
 
@@ -103,6 +104,10 @@ class MetatomicPotentialImpl(MLPotentialImpl):
       atomic numbers when omitted
     - ``pbc``: length-3 sequence of booleans; default is all-on or all-off from
       the topology and System
+
+    For periodic mixed ML/MM systems, :meth:`getMLLongRange` is inferred from the
+    model's ``interaction_range`` (``True`` when infinite). Pass ``mlLongRange``
+    to :meth:`~openmmml.MLPotential.createMixedSystem` to override that choice.
     """
 
     def __init__(
@@ -129,6 +134,28 @@ class MetatomicPotentialImpl(MLPotentialImpl):
         self.nonConservative = nonConservative
         self.variants = variants
         self.uncertaintyThreshold = uncertaintyThreshold
+        self._ml_long_range = None
+
+    def getMLLongRange(self) -> bool:
+        """Return whether the model includes all-image ML-ML interactions.
+
+        Uses ``capabilities.interaction_range``: infinite means long-range
+        (``True``), any finite value means short-range (``False``). Callers can
+        still pass ``mlLongRange`` to ``createMixedSystem()`` to override.
+        """
+        if self._ml_long_range is None:
+            try:
+                from metatomic.torch import load_atomistic_model
+            except ImportError as e:
+                raise ImportError(
+                    "Failed to import metatomic. Install it with "
+                    "'pip install metatomic-torch'."
+                ) from e
+            model = load_atomistic_model(
+                self.modelPath, extensions_directory=self.extensionsDirectory
+            )
+            self._ml_long_range = math.isinf(model.capabilities().interaction_range)
+        return self._ml_long_range
 
     def addForces(
         self,
