@@ -374,7 +374,7 @@ When creating metatomic models, the following keyword arguments to the `MLPotent
 | `checkConsistency` | If `True`, run metatomic consistency checks during evaluation.  The default is `False`. |
 | `nonConservative` | Controls whether forces come from model outputs rather than autograd on the energy.  `False` (default) is fully conservative.  `True` or `"forces"` reads `non_conservative_force`. |
 | `variants` | Dict mapping output names (`energy`, `energy_uncertainty`, `non_conservative_force`) to a variant string.  Setting `energy` also selects that variant for the other keys unless they are overridden. |
-| `uncertaintyThreshold` | Per-atom energy uncertainty threshold in kJ/mol.  If the model provides `energy_uncertainty` and any atom exceeds this value, a warning is issued.  The default is `9.65` (0.1 eV).  Set to `None` to disable. |
+| `uncertaintyThreshold` | Per-atom energy uncertainty threshold in kJ/mol.  If the model provides `energy_uncertainty` and any atom exceeds this value, a warning is issued.  The default is `10`.  Set to `None` to disable. |
 
 When using metatomic models, the following extra keyword arguments to `createSystem()` and `createMixedSystem()` are supported.
 
