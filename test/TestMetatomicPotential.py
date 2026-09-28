@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 import warnings
 from typing import Dict, List, Optional
@@ -18,8 +19,13 @@ from metatensor.torch import Labels, TensorBlock, TensorMap  # noqa: E402
 platform_ints = range(mm.Platform.getNumPlatforms())
 test_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
+# Same parameters as the metatomic ASE engine's lj-test comparison.
+_LJ_CUTOFF = 5.0  # Angstrom
+_LJ_SIGMA = 1.5808
+_LJ_EPSILON = 0.1729
 
-def _energy_map(energy: torch.Tensor, key: str = "energy") -> TensorMap:
+
+def _energy_map(energy: torch.Tensor) -> TensorMap:
     block = TensorBlock(
         values=energy,
         samples=Labels("system", torch.arange(energy.shape[0]).reshape(-1, 1)),
@@ -37,7 +43,7 @@ def _energy_outputs(
     result: Dict[str, TensorMap] = {}
     for key in outputs.keys():
         if key == "energy" or (len(key) >= 7 and key[0:7] == "energy/"):
-            result[key] = _energy_map(energy, key)
+            result[key] = _energy_map(energy)
     return result
 
 
@@ -75,94 +81,13 @@ class HarmonicModel(torch.nn.Module):
         return _energy_outputs(self._energy(systems, selected_atoms), outputs)
 
 
-class HarmonicNLModel(HarmonicModel):
-    def __init__(self, force_constant, equilibrium_positions, cutoff=0.4):
-        # cutoff is in the model's length unit (nm).
+class RequestedInputModel(HarmonicModel):
+    def __init__(self, force_constant, equilibrium_positions, requested):
         super().__init__(force_constant, equilibrium_positions)
-        self._nl_options = mta.NeighborListOptions(cutoff, False, True)
+        self._requested = requested
 
-    def requested_neighbor_lists(self) -> List[mta.NeighborListOptions]:
-        return [self._nl_options]
-
-    def forward(
-        self,
-        systems: List[mta.System],
-        outputs: Dict[str, mta.ModelOutput],
-        selected_atoms: Optional[Labels] = None,
-    ) -> Dict[str, TensorMap]:
-        energy = torch.zeros((len(systems), 1), dtype=systems[0].positions.dtype)
-        for i, system in enumerate(systems):
-            neighbors = system.get_neighbor_list(self._nl_options)
-            energy[i] += neighbors.values.sum() * 0.0
-            pos = _mask_positions(system.positions, selected_atoms)
-            eq = _mask_positions(self.equilibrium_positions, selected_atoms)
-            energy[i] += torch.sum(self.force_constant * (pos - eq) ** 2)
-        return _energy_outputs(energy, outputs)
-
-
-class HarmonicChargeModel(HarmonicModel):
     def requested_inputs(self) -> Dict[str, mta.ModelOutput]:
-        return {"charge": mta.ModelOutput(unit="e", sample_kind="system")}
-
-
-class HarmonicSpinModel(HarmonicModel):
-    def requested_inputs(self) -> Dict[str, mta.ModelOutput]:
-        return {
-            "spin_multiplicity": mta.ModelOutput(unit="", sample_kind="system")
-        }
-
-
-class PerAtomChargeModel(HarmonicModel):
-    def requested_inputs(self) -> Dict[str, mta.ModelOutput]:
-        return {"charge": mta.ModelOutput(unit="e", sample_kind="atom")}
-
-
-class HarmonicUQModel(HarmonicModel):
-    def __init__(self, force_constant, equilibrium_positions, uncertainty):
-        super().__init__(force_constant, equilibrium_positions)
-        self.uncertainty = uncertainty
-
-    def forward(
-        self,
-        systems: List[mta.System],
-        outputs: Dict[str, mta.ModelOutput],
-        selected_atoms: Optional[Labels] = None,
-    ) -> Dict[str, TensorMap]:
-        result = _energy_outputs(self._energy(systems, selected_atoms), outputs)
-        if "energy_uncertainty" not in outputs:
-            return result
-        n_atoms = systems[0].positions.shape[0]
-        if selected_atoms is not None:
-            atom_indices = selected_atoms.column("atom")
-            n_atoms = len(atom_indices)
-            samples = torch.stack(
-                [
-                    torch.zeros(n_atoms, dtype=torch.int32),
-                    atom_indices.to(dtype=torch.int32),
-                ],
-                dim=1,
-            )
-        else:
-            samples = torch.stack(
-                [
-                    torch.zeros(n_atoms, dtype=torch.int32),
-                    torch.arange(n_atoms, dtype=torch.int32),
-                ],
-                dim=1,
-            )
-        values = torch.full(
-            (n_atoms, 1), self.uncertainty, dtype=systems[0].positions.dtype
-        )
-        block = TensorBlock(
-            values=values,
-            samples=Labels(["system", "atom"], samples),
-            components=[],
-            properties=Labels("energy", torch.tensor([[0]])),
-        )
-        result["energy_uncertainty"] = TensorMap(
-            keys=Labels("_", torch.tensor([[0]])), blocks=[block]
-        )
-        return result
+        return self._requested
 
 
 def _export_model(path, model, atomic_types, interaction_range=0.0, outputs=None):
@@ -189,23 +114,23 @@ def _export_harmonic(path, positions_nm, atomic_types, force_constant=1.0):
     return _export_model(path, model, atomic_types)
 
 
-def _direct_energy_forces(model_path, numbers, positions_nm, energy_key="energy"):
-    model = mta.load_atomistic_model(model_path)
-    dtype = torch.float64
-    types = torch.tensor(numbers, dtype=torch.int32)
-    pos = torch.tensor(positions_nm, dtype=dtype, requires_grad=True)
-    cell = torch.zeros((3, 3), dtype=dtype)
-    pbc = torch.tensor([False, False, False])
-    system = mta.System(types, pos, cell, pbc)
-    options = mta.ModelEvaluationOptions(
-        length_unit="nm",
-        outputs={energy_key: mta.ModelOutput(unit="kJ/mol", sample_kind="system")},
-    )
-    energy = model([system], options, False)[energy_key].block().values.sum()
-    energy.backward()
+def _potential(path, **kwargs):
+    kwargs.setdefault("device", "cpu")
+    kwargs.setdefault("checkConsistency", True)
+    return MLPotential("metatomic", modelPath=path, **kwargs)
+
+
+def _energy(context):
     return (
-        float(energy.detach()),
-        (-pos.grad).detach().numpy(),
+        context.getState(getEnergy=True)
+        .getPotentialEnergy()
+        .value_in_unit(unit.kilojoules_per_mole)
+    )
+
+
+def _forces(context):
+    return context.getState(getForces=True).getForces(asNumpy=True).value_in_unit(
+        unit.kilojoules_per_mole / unit.nanometer
     )
 
 
@@ -220,33 +145,30 @@ def harmonic_toluene():
         yield pdb, numbers, positions, path
 
 
-def _energy(context):
-    return (
-        context.getState(getEnergy=True)
-        .getPotentialEnergy()
-        .value_in_unit(unit.kilojoules_per_mole)
-    )
+def _nickel(ase, supercell):
+    import ase.build
+
+    atoms = ase.build.bulk("Ni", "fcc", a=3.6, cubic=True)
+    if supercell != (1, 1, 1):
+        atoms = ase.build.make_supercell(atoms, np.diag(supercell))
+    atoms.positions += 0.2 * np.random.default_rng(0).random(atoms.positions.shape)
+    return atoms
+
+
+def _topology_positions(atoms, ase_units):
+    topology = app.Topology()
+    chain = topology.addChain()
+    residue = topology.addResidue("NI", chain)
+    element = app.Element.getByAtomicNumber(28)
+    for _ in range(len(atoms)):
+        topology.addAtom("Ni", element, residue)
+    cell_nm = atoms.cell.array / ase_units.nm
+    topology.setPeriodicBoxVectors([mm.Vec3(*row) for row in cell_nm])
+    return topology, atoms.positions / ase_units.nm
 
 
 @pytest.mark.parametrize("platform_int", list(platform_ints))
 class TestMetatomicPotential:
-    def testCreatePureMLSystem(self, platform_int, harmonic_toluene):
-        pdb, numbers, positions, model_path = harmonic_toluene
-        displaced = positions + 0.01
-        potential = MLPotential("metatomic", modelPath=model_path, device="cpu")
-        system = potential.createSystem(pdb.topology)
-        platform = mm.Platform.getPlatform(platform_int)
-        context = mm.Context(system, mm.VerletIntegrator(0.001), platform)
-        context.setPositions(displaced * unit.nanometer)
-        state = context.getState(getEnergy=True, getForces=True)
-        energy_ml = state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
-        forces_ml = state.getForces(asNumpy=True).value_in_unit(
-            unit.kilojoules_per_mole / unit.nanometer
-        )
-        energy_ref, forces_ref = _direct_energy_forces(model_path, numbers, displaced)
-        assert np.isclose(energy_ref, energy_ml, rtol=1e-6, atol=1e-8)
-        np.testing.assert_allclose(forces_ref, forces_ml, rtol=1e-5, atol=1e-6)
-
     def testCreateMixedSystem(self, platform_int, harmonic_toluene):
         _, _, positions, _ = harmonic_toluene
         prmtop = app.AmberPrmtopFile(
@@ -265,7 +187,7 @@ class TestMetatomicPotential:
             path = os.path.join(tmp, "harmonic-mixed.pt")
             _export_harmonic(path, positions, all_numbers)
             mm_system = prmtop.createSystem(nonbondedMethod=app.PME)
-            potential = MLPotential("metatomic", modelPath=path, device="cpu")
+            potential = _potential(path)
             # Finite interaction_range => getMLLongRange() is False; no need to pass
             # mlLongRange. An explicit value remains allowed as an override.
             mixed_system = potential.createMixedSystem(
@@ -304,71 +226,69 @@ class TestMetatomicPotential:
             # Empty => applies to all atoms; OpenMM returns a tuple.
             assert len(python_forces[0].getParticles()) == 0
 
-    def testNeighborList(self, platform_int, harmonic_toluene):
-        pytest.importorskip("vesin", reason="vesin is not installed")
+    def testExtraInputs(self, platform_int, harmonic_toluene):
         pdb, _, positions, _ = harmonic_toluene
         numbers = [atom.element.atomic_number for atom in pdb.topology.atoms()]
+        equilibrium = torch.tensor(positions, dtype=torch.float64)
+        cases = [
+            ({"charge": mta.ModelOutput(unit="e", sample_kind="system")}, {"charge": 0}),
+            (
+                {
+                    "spin_multiplicity": mta.ModelOutput(
+                        unit="", sample_kind="system"
+                    )
+                },
+                {"multiplicity": 1},
+            ),
+            (
+                {
+                    "spin_multiplicity": mta.ModelOutput(
+                        unit="", sample_kind="system"
+                    )
+                },
+                {"spinMultiplicity": 1},
+            ),
+        ]
+        platform = mm.Platform.getPlatform(platform_int)
         with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "harmonic-nl.pt")
-            _export_model(
-                path,
-                HarmonicNLModel(1.0, torch.tensor(positions, dtype=torch.float64)),
-                numbers,
-                interaction_range=0.4,
-            )
-            potential = MLPotential("metatomic", modelPath=path, device="cpu")
-            system = potential.createSystem(pdb.topology)
-            platform = mm.Platform.getPlatform(platform_int)
-            context = mm.Context(system, mm.VerletIntegrator(0.001), platform)
-            context.setPositions((positions + 0.01) * unit.nanometer)
-            energy = _energy(context)
-            assert np.isfinite(energy)
-            assert energy != 0.0
+            for i, (requested, kwargs) in enumerate(cases):
+                path = os.path.join(tmp, f"extra-{i}.pt")
+                _export_model(
+                    path, RequestedInputModel(1.0, equilibrium, requested), numbers
+                )
+                system = _potential(path).createSystem(pdb.topology, **kwargs)
+                context = mm.Context(system, mm.VerletIntegrator(0.001), platform)
+                context.setPositions(positions * unit.nanometer)
+                assert np.isclose(_energy(context), 0.0, atol=1e-8)
 
-    def testChargeAndCheckConsistency(self, platform_int, harmonic_toluene):
-        pdb, _, positions, _ = harmonic_toluene
-        numbers = [atom.element.atomic_number for atom in pdb.topology.atoms()]
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "harmonic-charge.pt")
+            path = os.path.join(tmp, "per-atom-charge.pt")
             _export_model(
                 path,
-                HarmonicChargeModel(1.0, torch.tensor(positions, dtype=torch.float64)),
+                RequestedInputModel(
+                    1.0,
+                    equilibrium,
+                    {"charge": mta.ModelOutput(unit="e", sample_kind="atom")},
+                ),
                 numbers,
             )
-            potential = MLPotential(
-                "metatomic",
-                modelPath=path,
-                device="cpu",
-                checkConsistency=True,
-            )
-            system = potential.createSystem(
-                pdb.topology, charge=0, multiplicity=1
-            )
-            platform = mm.Platform.getPlatform(platform_int)
-            context = mm.Context(system, mm.VerletIntegrator(0.001), platform)
-            context.setPositions(positions * unit.nanometer)
-            assert np.isclose(_energy(context), 0.0, atol=1e-8)
-
-    def testPerAtomChargeRejected(self, platform_int, harmonic_toluene):
-        pdb, _, positions, _ = harmonic_toluene
-        numbers = [atom.element.atomic_number for atom in pdb.topology.atoms()]
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "harmonic-atom-charge.pt")
-            _export_model(
-                path,
-                PerAtomChargeModel(1.0, torch.tensor(positions, dtype=torch.float64)),
-                numbers,
-            )
-            potential = MLPotential("metatomic", modelPath=path, device="cpu")
-            with pytest.raises(ValueError, match="sample_kind='atom'"):
-                potential.createSystem(pdb.topology)
+            with pytest.raises(
+                ValueError,
+                match=re.escape(
+                    "this model requests extra input 'charge' (sample_kind='atom'), "
+                    "which is not implemented by MLPotential('metatomic')"
+                ),
+            ):
+                MLPotential("metatomic", modelPath=path, device="cpu").createSystem(
+                    pdb.topology
+                )
 
     def testPartialPbc(self, platform_int, harmonic_toluene):
         pdb, _, positions, model_path = harmonic_toluene
         box = [mm.Vec3(2, 0, 0), mm.Vec3(0, 2, 0), mm.Vec3(0, 0, 2)]
         box = [v * unit.nanometer for v in box]
-        potential = MLPotential("metatomic", modelPath=model_path, device="cpu")
-        system = potential.createSystem(pdb.topology, pbc=(True, True, False))
+        system = _potential(model_path).createSystem(
+            pdb.topology, pbc=(True, True, False)
+        )
         system.setDefaultPeriodicBoxVectors(*box)
         python_forces = [
             f for f in system.getForces() if isinstance(f, mm.PythonForce)
@@ -380,31 +300,73 @@ class TestMetatomicPotential:
         context.setPositions(positions * unit.nanometer)
         assert np.isfinite(_energy(context))
 
-    def testAgreesWithASE(self, platform_int, harmonic_toluene):
-        pytest.importorskip("ase", reason="ASE is not installed")
-        pytest.importorskip("metatomic_ase", reason="metatomic-ase is not installed")
-        from metatomic_ase import MetatomicCalculator
+    def testLennardJones(self, platform_int):
+        lj = pytest.importorskip("metatomic_lj_test")
+        ase = pytest.importorskip("ase")
+        pytest.importorskip("vesin")
+        import ase.calculators.lj
+        import ase.units
 
-        pdb, _, positions, model_path = harmonic_toluene
-        displaced = positions + 0.005
+        model = lj.lennard_jones_model(
+            atomic_type=28,
+            cutoff=_LJ_CUTOFF,
+            sigma=_LJ_SIGMA,
+            epsilon=_LJ_EPSILON,
+            length_unit="Angstrom",
+            energy_unit="eV",
+            with_extension=False,
+        )
+        small = _nickel(ase, (1, 1, 1))
+        large = _nickel(ase, (2, 2, 2))
         platform = mm.Platform.getPlatform(platform_int)
-        native = MLPotential("metatomic", modelPath=model_path, device="cpu")
-        native_system = native.createSystem(pdb.topology)
-        native_context = mm.Context(
-            native_system, mm.VerletIntegrator(0.001), platform
-        )
-        native_context.setPositions(displaced * unit.nanometer)
-        native_energy = _energy(native_context)
+        # ASE reports eV and eV/Angstrom. OpenMM reports kJ/mol and kJ/mol/nm.
+        to_kj_mol = ase.units.mol / ase.units.kJ
+        angstrom_per_nm = ase.units.nm
 
-        calculator = MetatomicCalculator(
-            model_path, device="cpu", do_gradients_with_energy=True
-        )
-        ase_system = MLPotential("ase").createSystem(
-            pdb.topology, calculator=calculator
-        )
-        ase_context = mm.Context(ase_system, mm.VerletIntegrator(0.001), platform)
-        ase_context.setPositions(displaced * unit.nanometer)
-        assert np.isclose(native_energy, _energy(ase_context), rtol=1e-5, atol=1e-6)
+        def reference(atoms):
+            ref = atoms.copy()
+            ref.calc = ase.calculators.lj.LennardJones(
+                sigma=_LJ_SIGMA,
+                epsilon=_LJ_EPSILON,
+                rc=_LJ_CUTOFF,
+                ro=_LJ_CUTOFF,
+                smooth=False,
+            )
+            energy = ref.get_potential_energy() * to_kj_mol
+            forces = ref.get_forces() * to_kj_mol * angstrom_per_nm
+            return energy, forces
+
+        def evaluate(atoms, **potential_kwargs):
+            topology, positions_nm = _topology_positions(atoms, ase.units)
+            system = _potential(path, **potential_kwargs).createSystem(
+                topology, removeCMMotion=False
+            )
+            context = mm.Context(system, mm.VerletIntegrator(0.001), platform)
+            context.setPositions(positions_nm * unit.nanometer)
+            return context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lj.pt")
+            model.save(path)
+
+            energy_ref, forces_ref = reference(small)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                context = evaluate(small)
+                energy_ml = _energy(context)
+                forces_ml = _forces(context)
+            assert not any("uncertainties" in str(w.message) for w in caught)
+            assert np.isclose(energy_ref, energy_ml, rtol=1e-5, atol=1e-8)
+            np.testing.assert_allclose(forces_ref, forces_ml, rtol=1e-5, atol=1e-6)
+
+            context = evaluate(small, variants={"energy": "doubled"})
+            assert np.isclose(2.0 * energy_ref, _energy(context), rtol=1e-5, atol=1e-8)
+            np.testing.assert_allclose(
+                2.0 * forces_ref, _forces(context), rtol=1e-5, atol=1e-6
+            )
+
+            with pytest.warns(UserWarning, match="atomic energy uncertainties"):
+                _energy(evaluate(large))
 
 
 class TestMetatomicPotentialOptions:
@@ -416,93 +378,11 @@ class TestMetatomicPotentialOptions:
             device="cpu",
             nonConservative=True,
         )
-        with pytest.raises(ValueError, match="non_conservative_force"):
+        with pytest.raises(
+            ValueError,
+            match="output 'non_conservative_force' not found in outputs",
+        ):
             potential.createSystem(pdb.topology)
-
-    def testVariants(self, harmonic_toluene):
-        pdb, numbers, positions, _ = harmonic_toluene
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "harmonic-variant.pt")
-            _export_model(
-                path,
-                HarmonicModel(1.0, torch.tensor(positions, dtype=torch.float64)),
-                numbers,
-                outputs={
-                    "energy/pbe": mta.ModelOutput(unit="eV", sample_kind="system")
-                },
-            )
-            missing = MLPotential("metatomic", modelPath=path, device="cpu")
-            with pytest.raises(ValueError, match="no default variant"):
-                missing.createSystem(pdb.topology)
-            potential = MLPotential(
-                "metatomic",
-                modelPath=path,
-                device="cpu",
-                variants={"energy": "pbe"},
-            )
-            system = potential.createSystem(pdb.topology)
-            context = mm.Context(system, mm.VerletIntegrator(0.001))
-            displaced = positions + 0.01
-            context.setPositions(displaced * unit.nanometer)
-            energy_ml = _energy(context)
-            energy_ref, _ = _direct_energy_forces(
-                path, numbers, displaced, energy_key="energy/pbe"
-            )
-            assert np.isclose(energy_ref, energy_ml, rtol=1e-6, atol=1e-8)
-
-    def testUncertaintyThreshold(self, harmonic_toluene):
-        pdb, numbers, positions, _ = harmonic_toluene
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "harmonic-uq.pt")
-            # Model stores uncertainty in eV; engine requests kJ/mol conversion.
-            _export_model(
-                path,
-                HarmonicUQModel(
-                    1.0, torch.tensor(positions, dtype=torch.float64), 0.5
-                ),
-                numbers,
-                outputs={
-                    "energy": mta.ModelOutput(unit="eV", sample_kind="system"),
-                    "energy_uncertainty": mta.ModelOutput(
-                        unit="eV", sample_kind="atom"
-                    ),
-                },
-            )
-            quiet = MLPotential(
-                "metatomic",
-                modelPath=path,
-                device="cpu",
-                uncertaintyThreshold=None,
-            )
-            system = quiet.createSystem(pdb.topology)
-            context = mm.Context(system, mm.VerletIntegrator(0.001))
-            context.setPositions(positions * unit.nanometer)
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                _energy(context)
-            assert not any(
-                "uncertainties" in str(w.message) for w in caught
-            )
-
-            loud = MLPotential("metatomic", modelPath=path, device="cpu")
-            system = loud.createSystem(pdb.topology)
-            context = mm.Context(system, mm.VerletIntegrator(0.001))
-            context.setPositions(positions * unit.nanometer)
-            with pytest.warns(UserWarning, match="atomic energy uncertainties"):
-                _energy(context)
-
-    def testSpinMultiplicityAlias(self, harmonic_toluene):
-        pdb, numbers, positions, _ = harmonic_toluene
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "harmonic-spin.pt")
-            _export_model(
-                path,
-                HarmonicSpinModel(1.0, torch.tensor(positions, dtype=torch.float64)),
-                numbers,
-            )
-            potential = MLPotential("metatomic", modelPath=path, device="cpu")
-            potential.createSystem(pdb.topology, multiplicity=1)
-            potential.createSystem(pdb.topology, spinMultiplicity=1)
 
     def testAtomTypes(self, harmonic_toluene):
         pdb, numbers, positions, _ = harmonic_toluene
@@ -510,8 +390,10 @@ class TestMetatomicPotentialOptions:
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "harmonic-types.pt")
             _export_harmonic(path, positions, custom_types)
-            potential = MLPotential("metatomic", modelPath=path, device="cpu")
-            with pytest.raises(ValueError, match="atomic type"):
+            potential = _potential(path)
+            with pytest.raises(
+                ValueError, match="this model does not support atomic type 6"
+            ):
                 potential.createSystem(pdb.topology)
             system = potential.createSystem(pdb.topology, atomTypes=custom_types)
             context = mm.Context(system, mm.VerletIntegrator(0.001))
@@ -521,7 +403,9 @@ class TestMetatomicPotentialOptions:
     def testInvalidPbcLength(self, harmonic_toluene):
         pdb, _, _, model_path = harmonic_toluene
         potential = MLPotential("metatomic", modelPath=model_path, device="cpu")
-        with pytest.raises(ValueError, match="length-3"):
+        with pytest.raises(
+            ValueError, match="pbc must be a length-3 sequence of booleans"
+        ):
             potential.createSystem(pdb.topology, pbc=(True, False))
 
     def testGetMLLongRangeFromInteractionRange(self, harmonic_toluene):
@@ -573,7 +457,7 @@ class TestMetatomicPotentialOptions:
                 interaction_range=float("inf"),
             )
             mm_system = prmtop.createSystem(nonbondedMethod=app.PME)
-            potential = MLPotential("metatomic", modelPath=path, device="cpu")
+            potential = _potential(path)
             impl = MetatomicPotentialImpl(
                 "metatomic", path, "cpu", None, False
             )

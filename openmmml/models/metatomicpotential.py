@@ -39,8 +39,7 @@ from openmmml.mlpotential import MLPotentialImpl, MLPotentialImplFactory
 _DTYPES = {"float32", "float64"}
 _INPUT_DEFAULTS = {"charge": (0.0, "e"), "spin_multiplicity": (1.0, "")}
 _VALID_NC = (True, False, "forces")
-# 0.1 eV in kJ/mol; OpenMM native energy unit.
-_DEFAULT_UNCERTAINTY_THRESHOLD = 9.648533212
+_DEFAULT_UNCERTAINTY_THRESHOLD_KJ_MOL = 10.0
 # Neighbor-list skin in nm (2 Å). Set to -1 once vesin supports auto skin.
 _NL_SKIN = 0.2
 
@@ -57,7 +56,7 @@ class MetatomicPotentialImplFactory(MLPotentialImplFactory):
         checkConsistency: bool = False,
         nonConservative=False,
         variants=None,
-        uncertaintyThreshold=_DEFAULT_UNCERTAINTY_THRESHOLD,
+        uncertaintyThreshold=_DEFAULT_UNCERTAINTY_THRESHOLD_KJ_MOL,
         **args,
     ) -> MLPotentialImpl:
         return MetatomicPotentialImpl(
@@ -78,9 +77,7 @@ class MetatomicPotentialImpl(MLPotentialImpl):
     Load a TorchScript model produced by :func:`metatomic.torch.load_atomistic_model`
     (typically a ``.pt`` file) and install a single :class:`openmm.PythonForce`.
     Neighbor lists use ``vesin.metatomic`` (CPU and CUDA). Conservative forces are
-    ``-dE/dx`` via autograd. The energy always depends on the cell when the
-    system is periodic; OpenMM MonteCarlo barostats can run NPT by
-    finite-differencing that energy. :class:`openmm.PythonForce` returns only
+    ``-dE/dx`` via autograd. :class:`openmm.PythonForce` returns only
     energy and forces, so an explicit virial cannot be passed to the integrator.
 
     >>> potential = MLPotential(
@@ -91,7 +88,7 @@ class MetatomicPotentialImpl(MLPotentialImpl):
     ...     checkConsistency=False,
     ...     nonConservative=False,
     ...     variants={"energy": "pbe"},
-    ...     uncertaintyThreshold=9.65,
+    ...     uncertaintyThreshold=10,
     ... )
     >>> system = potential.createSystem(topology)
 
@@ -119,7 +116,7 @@ class MetatomicPotentialImpl(MLPotentialImpl):
         checkConsistency,
         nonConservative=False,
         variants=None,
-        uncertaintyThreshold=_DEFAULT_UNCERTAINTY_THRESHOLD,
+        uncertaintyThreshold=_DEFAULT_UNCERTAINTY_THRESHOLD_KJ_MOL,
     ):
         if nonConservative not in _VALID_NC:
             raise ValueError(
@@ -237,14 +234,10 @@ class MetatomicPotentialImpl(MLPotentialImpl):
             ]
 
         selected_atoms = None
-        selected_atom_indices = None
         if atoms is not None:
-            selected_atom_indices = list(atoms)
             selected_atoms = Labels(
                 ["system", "atom"],
-                torch.tensor(
-                    [[0, i] for i in selected_atom_indices], dtype=torch.int32
-                ),
+                torch.tensor([[0, i] for i in atoms], dtype=torch.int32),
             )
 
         pbc = _resolve_pbc(args, topology, system, device)
@@ -279,7 +272,6 @@ class MetatomicPotentialImpl(MLPotentialImpl):
             check_consistency=self.checkConsistency,
             pbc=pbc,
             dtype=dtype,
-            selected_atom_indices=selected_atom_indices,
         )
         force = openmm.PythonForce(compute)
         force.setForceGroup(forceGroup)
@@ -432,7 +424,6 @@ class _ComputeMetatomic:
         check_consistency,
         pbc,
         dtype,
-        selected_atom_indices,
     ):
         self.model = model
         self.model_path = model_path
@@ -449,7 +440,6 @@ class _ComputeMetatomic:
         self.check_consistency = check_consistency
         self.pbc = pbc
         self.dtype = dtype
-        self.selected_atom_indices = selected_atom_indices
 
     def __call__(self, state):
         import torch
@@ -486,28 +476,26 @@ class _ComputeMetatomic:
         outputs = self.model([system], self.options, self.check_consistency)
         energy = outputs[self.energy_key].block().values.sum()
         if self.uq_key is not None:
-            uncertainty = outputs[self.uq_key].block().values.detach().cpu().numpy()
-            threshold = self.uncertainty_threshold
-            if np.any(uncertainty > threshold):
+            block = outputs[self.uq_key].block()
+            uncertainty = block.values.detach().cpu().numpy().reshape(-1)
+            above = np.flatnonzero(uncertainty > self.uncertainty_threshold)
+            if len(above):
+                atoms = block.samples.column("atom").detach().cpu().numpy()
                 warnings.warn(
                     "Some of the atomic energy uncertainties are larger than the "
-                    f"threshold of {threshold} kJ/mol. The prediction is above the "
-                    f"threshold for atoms {np.where(uncertainty > threshold)[0]}.",
+                    f"threshold of {self.uncertainty_threshold} kJ/mol. The "
+                    f"prediction is above the threshold for atoms {atoms[above]}.",
                     stacklevel=2,
                 )
         if do_force_grad:
             energy.backward()
         if self.nc_forces_key is not None:
-            nc_forces = (
-                outputs[self.nc_forces_key].block().values.detach().reshape(-1, 3)
-            )
+            block = outputs[self.nc_forces_key].block()
+            nc_forces = block.values.detach().reshape(-1, 3)
             nc_forces = nc_forces - nc_forces.mean(dim=0, keepdim=True)
-            nc_forces = nc_forces.cpu().numpy()
+            atoms = block.samples.column("atom").detach().cpu().numpy()
             forces = np.zeros((len(self.types), 3), dtype=np.float64)
-            if self.selected_atom_indices is None:
-                forces[:] = nc_forces
-            else:
-                forces[self.selected_atom_indices] = nc_forces
+            forces[atoms] = nc_forces.cpu().numpy()
         else:
             grad = system.positions.grad
             if grad is None:
@@ -533,7 +521,6 @@ class _ComputeMetatomic:
             "pbc": self.pbc.detach().cpu(),
             "dtype_name": str(self.dtype).removeprefix("torch."),
             "device": str(self.types.device),
-            "selected_atom_indices": self.selected_atom_indices,
         }
 
     def __setstate__(self, state):
@@ -557,7 +544,6 @@ class _ComputeMetatomic:
         self.check_consistency = state["check_consistency"]
         self.pbc = state["pbc"].to(device=device)
         self.dtype = getattr(torch, state["dtype_name"])
-        self.selected_atom_indices = state["selected_atom_indices"]
         self.neighbor_lists = []
         if self.nl_options:
             import vesin.metatomic
