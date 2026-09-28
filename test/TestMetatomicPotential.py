@@ -229,33 +229,25 @@ class TestMetatomicPotential:
         pdb, _, positions, _ = harmonic_toluene
         numbers = [atom.element.atomic_number for atom in pdb.topology.atoms()]
         equilibrium = torch.tensor(positions, dtype=torch.float64)
+        # charge and spin_multiplicity are the extra inputs this backend accepts.
+        requested = {
+            "charge": mta.ModelOutput(unit="e", sample_kind="system"),
+            "spin_multiplicity": mta.ModelOutput(unit="", sample_kind="system"),
+        }
         cases = [
-            ({"charge": mta.ModelOutput(unit="e", sample_kind="system")}, {"charge": 0}),
-            (
-                {
-                    "spin_multiplicity": mta.ModelOutput(
-                        unit="", sample_kind="system"
-                    )
-                },
-                {"multiplicity": 1},
-            ),
-            (
-                {
-                    "spin_multiplicity": mta.ModelOutput(
-                        unit="", sample_kind="system"
-                    )
-                },
-                {"spinMultiplicity": 1},
-            ),
+            {},
+            {"charge": 0, "multiplicity": 1},
+            {"charge": 0, "spinMultiplicity": 1},
         ]
         platform = mm.Platform.getPlatform(platform_int)
         with tempfile.TemporaryDirectory() as tmp:
-            for i, (requested, kwargs) in enumerate(cases):
-                path = os.path.join(tmp, f"extra-{i}.pt")
-                _export_model(
-                    path, RequestedInputModel(1.0, equilibrium, requested), numbers
-                )
-                system = _potential(path).createSystem(pdb.topology, **kwargs)
+            path = os.path.join(tmp, "extra.pt")
+            _export_model(
+                path, RequestedInputModel(1.0, equilibrium, requested), numbers
+            )
+            potential = _potential(path)
+            for kwargs in cases:
+                system = potential.createSystem(pdb.topology, **kwargs)
                 context = mm.Context(system, mm.VerletIntegrator(0.001), platform)
                 context.setPositions(positions * unit.nanometer)
                 assert np.isclose(_energy(context), 0.0, atol=1e-8)
@@ -423,10 +415,10 @@ class TestMetatomicPotentialOptions:
                 interaction_range=float("inf"),
             )
             short = MetatomicPotentialImpl(
-                "metatomic", short_path, "cpu", None, False
+                "metatomic", short_path, "cpu", None, True
             )
             long = MetatomicPotentialImpl(
-                "metatomic", long_path, "cpu", None, False
+                "metatomic", long_path, "cpu", None, True
             )
             assert short.getMLLongRange() is False
             assert long.getMLLongRange() is True
@@ -454,7 +446,7 @@ class TestMetatomicPotentialOptions:
             mm_system = prmtop.createSystem(nonbondedMethod=app.PME)
             potential = _potential(path)
             impl = MetatomicPotentialImpl(
-                "metatomic", path, "cpu", None, False
+                "metatomic", path, "cpu", None, True
             )
             assert impl.getMLLongRange() is True
             mixed = potential.createMixedSystem(
