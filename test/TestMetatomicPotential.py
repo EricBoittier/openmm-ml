@@ -9,12 +9,11 @@ import openmm as mm
 import openmm.app as app
 import openmm.unit as unit
 import pytest
+import torch
+import metatomic.torch as mta
+from metatensor.torch import Labels, TensorBlock, TensorMap
 
 from openmmml import MLPotential
-
-torch = pytest.importorskip("torch", reason="torch is not installed")
-mta = pytest.importorskip("metatomic.torch", reason="metatomic-torch is not installed")
-from metatensor.torch import Labels, TensorBlock, TensorMap  # noqa: E402
 
 platform_ints = range(mm.Platform.getNumPlatforms())
 test_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
@@ -297,11 +296,11 @@ class TestMetatomicPotential:
         assert np.isfinite(_energy(context))
 
     def testLennardJones(self, platform_int):
-        lj = pytest.importorskip("metatomic_lj_test")
-        ase = pytest.importorskip("ase")
-        pytest.importorskip("vesin")
+        import ase
         import ase.calculators.lj
         import ase.units
+        import metatomic_lj_test as lj
+        import vesin  # noqa: F401
 
         model = lj.lennard_jones_model(
             atomic_type=28,
