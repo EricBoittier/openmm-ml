@@ -36,7 +36,6 @@ import numpy as np
 import openmm
 from openmmml.mlpotential import MLPotentialImpl, MLPotentialImplFactory
 
-_DTYPES = {"float32", "float64"}
 _INPUT_DEFAULTS = {"charge": (0.0, "e"), "spin_multiplicity": (1.0, "")}
 _VALID_NC = (True, False, "forces")
 _DEFAULT_UNCERTAINTY_THRESHOLD_KJ_MOL = 10.0
@@ -195,10 +194,7 @@ class MetatomicPotentialImpl(MLPotentialImpl):
         if desired is not None and not isinstance(desired, str):
             desired = str(desired)
         device = torch.device(pick_device(capabilities.supported_devices, desired))
-        dtype_name = capabilities.dtype
-        if dtype_name not in _DTYPES:
-            raise ValueError(f"Unsupported model dtype '{dtype_name}'.")
-        dtype = getattr(torch, dtype_name)
+        dtype = getattr(torch, capabilities.dtype)
         model = model.to(device=device)
         types = torch.tensor(types, dtype=torch.int32, device=device)
 
@@ -481,10 +477,11 @@ class _ComputeMetatomic:
             above = np.flatnonzero(uncertainty > self.uncertainty_threshold)
             if len(above):
                 atoms = block.samples.column("atom").detach().cpu().numpy()
+                flagged = sorted(int(i) for i in atoms[above])
                 warnings.warn(
                     "Some of the atomic energy uncertainties are larger than the "
                     f"threshold of {self.uncertainty_threshold} kJ/mol. The "
-                    f"prediction is above the threshold for atoms {atoms[above]}.",
+                    f"prediction is above the threshold for atoms {flagged}.",
                     stacklevel=2,
                 )
         if do_force_grad:

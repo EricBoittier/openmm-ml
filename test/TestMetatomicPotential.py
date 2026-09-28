@@ -271,16 +271,12 @@ class TestMetatomicPotential:
                 ),
                 numbers,
             )
-            with pytest.raises(
-                ValueError,
-                match=re.escape(
-                    "this model requests extra input 'charge' (sample_kind='atom'), "
-                    "which is not implemented by MLPotential('metatomic')"
-                ),
-            ):
-                MLPotential("metatomic", modelPath=path, device="cpu").createSystem(
-                    pdb.topology
-                )
+            message = (
+                "this model requests extra input 'charge' (sample_kind='atom'), "
+                "which is not implemented by MLPotential('metatomic')"
+            )
+            with pytest.raises(ValueError, match=re.escape(message)):
+                _potential(path).createSystem(pdb.topology)
 
     def testPartialPbc(self, platform_int, harmonic_toluene):
         pdb, _, positions, model_path = harmonic_toluene
@@ -355,7 +351,11 @@ class TestMetatomicPotential:
                 context = evaluate(small)
                 energy_ml = _energy(context)
                 forces_ml = _forces(context)
-            assert not any("uncertainties" in str(w.message) for w in caught)
+            uncertainty = (
+                "Some of the atomic energy uncertainties are larger than the "
+                "threshold of 10.0 kJ/mol."
+            )
+            assert not any(str(w.message).startswith(uncertainty) for w in caught)
             assert np.isclose(energy_ref, energy_ml, rtol=1e-5, atol=1e-8)
             np.testing.assert_allclose(forces_ref, forces_ml, rtol=1e-5, atol=1e-6)
 
@@ -365,23 +365,21 @@ class TestMetatomicPotential:
                 2.0 * forces_ref, _forces(context), rtol=1e-5, atol=1e-6
             )
 
-            with pytest.warns(UserWarning, match="atomic energy uncertainties"):
+            message = (
+                "Some of the atomic energy uncertainties are larger than the "
+                "threshold of 10.0 kJ/mol. The prediction is above the threshold "
+                f"for atoms {list(range(len(large)))}."
+            )
+            with pytest.warns(UserWarning, match=re.escape(message)):
                 _energy(evaluate(large))
 
 
 class TestMetatomicPotentialOptions:
     def testNonConservativeRequiresOutput(self, harmonic_toluene):
         pdb, _, _, model_path = harmonic_toluene
-        potential = MLPotential(
-            "metatomic",
-            modelPath=model_path,
-            device="cpu",
-            nonConservative=True,
-        )
-        with pytest.raises(
-            ValueError,
-            match="output 'non_conservative_force' not found in outputs",
-        ):
+        potential = _potential(model_path, nonConservative=True)
+        message = "output 'non_conservative_force' not found in outputs"
+        with pytest.raises(ValueError, match=re.escape(message)):
             potential.createSystem(pdb.topology)
 
     def testAtomTypes(self, harmonic_toluene):
@@ -391,9 +389,8 @@ class TestMetatomicPotentialOptions:
             path = os.path.join(tmp, "harmonic-types.pt")
             _export_harmonic(path, positions, custom_types)
             potential = _potential(path)
-            with pytest.raises(
-                ValueError, match="this model does not support atomic type 6"
-            ):
+            message = "this model does not support atomic type 6"
+            with pytest.raises(ValueError, match=re.escape(message)):
                 potential.createSystem(pdb.topology)
             system = potential.createSystem(pdb.topology, atomTypes=custom_types)
             context = mm.Context(system, mm.VerletIntegrator(0.001))
@@ -402,10 +399,9 @@ class TestMetatomicPotentialOptions:
 
     def testInvalidPbcLength(self, harmonic_toluene):
         pdb, _, _, model_path = harmonic_toluene
-        potential = MLPotential("metatomic", modelPath=model_path, device="cpu")
-        with pytest.raises(
-            ValueError, match="pbc must be a length-3 sequence of booleans"
-        ):
+        potential = _potential(model_path)
+        message = "pbc must be a length-3 sequence of booleans"
+        with pytest.raises(ValueError, match=re.escape(message)):
             potential.createSystem(pdb.topology, pbc=(True, False))
 
     def testGetMLLongRangeFromInteractionRange(self, harmonic_toluene):
