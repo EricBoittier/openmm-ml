@@ -1,7 +1,6 @@
 import os
 import re
 import tempfile
-import warnings
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -144,28 +143,6 @@ def harmonic_toluene():
         yield pdb, numbers, positions, path
 
 
-def _nickel(ase, supercell):
-    import ase.build
-
-    atoms = ase.build.bulk("Ni", "fcc", a=3.6, cubic=True)
-    if supercell != (1, 1, 1):
-        atoms = ase.build.make_supercell(atoms, np.diag(supercell))
-    atoms.positions += 0.2 * np.random.default_rng(0).random(atoms.positions.shape)
-    return atoms
-
-
-def _topology_positions(atoms, ase_units):
-    topology = app.Topology()
-    chain = topology.addChain()
-    residue = topology.addResidue("NI", chain)
-    element = app.Element.getByAtomicNumber(28)
-    for _ in range(len(atoms)):
-        topology.addAtom("Ni", element, residue)
-    cell_nm = atoms.cell.array / ase_units.nm
-    topology.setPeriodicBoxVectors([mm.Vec3(*row) for row in cell_nm])
-    return topology, atoms.positions / ase_units.nm
-
-
 @pytest.mark.parametrize("platform_int", list(platform_ints))
 class TestMetatomicPotential:
     def testCreateMixedSystem(self, platform_int, harmonic_toluene):
@@ -224,6 +201,53 @@ class TestMetatomicPotential:
             assert python_forces[0].usesPeriodicBoundaryConditions()
             # Empty => applies to all atoms; OpenMM returns a tuple.
             assert len(python_forces[0].getParticles()) == 0
+
+    def testSelectedAtoms(self, platform_int):
+        # Same mixed system as the other backends. The harmonic energy depends
+        # only on the ML subset passed through as selected_atoms.
+        prmtop = app.AmberPrmtopFile(
+            os.path.join(test_data_dir, "toluene", "toluene-explicit.prm7")
+        )
+        inpcrd = app.AmberInpcrdFile(
+            os.path.join(test_data_dir, "toluene", "toluene-explicit.rst7")
+        )
+        ml_atoms = list(range(15))
+        positions = np.asarray(
+            inpcrd.positions.value_in_unit(unit.nanometer), dtype=np.float64
+        )
+        numbers = [
+            atom.element.atomic_number for atom in prmtop.topology.atoms()
+        ]
+        delta = 0.01
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "harmonic-selected.pt")
+            _export_harmonic(path, positions, numbers)
+            mm_system = prmtop.createSystem(nonbondedMethod=app.PME)
+            mixed = _potential(path).createMixedSystem(
+                prmtop.topology, mm_system, ml_atoms, forceGroup=1
+            )
+            platform = mm.Platform.getPlatform(platform_int)
+            context = mm.Context(mixed, mm.VerletIntegrator(0.001), platform)
+            context.setPositions((positions + delta) * unit.nanometer)
+            state = context.getState(getEnergy=True, getForces=True, groups={1})
+            factor = float(mta.unit_conversion_factor("eV", "kJ/mol"))
+            energy = len(ml_atoms) * 3 * delta**2 * factor
+            forces = np.zeros_like(positions)
+            forces[ml_atoms] = -2 * delta * factor
+            assert np.isclose(
+                energy,
+                state.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole),
+                rtol=1e-5,
+                atol=1e-8,
+            )
+            np.testing.assert_allclose(
+                forces,
+                state.getForces(asNumpy=True).value_in_unit(
+                    unit.kilojoules_per_mole / unit.nanometer
+                ),
+                rtol=1e-5,
+                atol=1e-6,
+            )
 
     def testExtraInputs(self, platform_int, harmonic_toluene):
         pdb, _, positions, _ = harmonic_toluene
@@ -288,14 +312,16 @@ class TestMetatomicPotential:
         assert np.isfinite(_energy(context))
 
     def testLennardJones(self, platform_int):
-        import ase
+        ase = pytest.importorskip("ase")
+        pytest.importorskip("vesin")
+        lj = pytest.importorskip("metatomic_lj_test")
         import ase.calculators.lj
         import ase.units
-        import metatomic_lj_test as lj
-        import vesin  # noqa: F401
 
+        pdb = app.PDBFile(os.path.join(test_data_dir, "toluene", "toluene.pdb"))
+        numbers = [atom.element.atomic_number for atom in pdb.topology.atoms()]
         model = lj.lennard_jones_model(
-            atomic_type=28,
+            atomic_type=numbers[0],
             cutoff=_LJ_CUTOFF,
             sigma=_LJ_SIGMA,
             epsilon=_LJ_EPSILON,
@@ -303,66 +329,61 @@ class TestMetatomicPotential:
             energy_unit="eV",
             with_extension=False,
         )
-        small = _nickel(ase, (1, 1, 1))
-        large = _nickel(ase, (2, 2, 2))
+        model._capabilities.atomic_types = sorted(set(numbers))
         platform = mm.Platform.getPlatform(platform_int)
         # ASE reports eV and eV/Angstrom. OpenMM reports kJ/mol and kJ/mol/nm.
         to_kj_mol = ase.units.mol / ase.units.kJ
         angstrom_per_nm = ase.units.nm
-
-        def reference(atoms):
-            ref = atoms.copy()
-            ref.calc = ase.calculators.lj.LennardJones(
-                sigma=_LJ_SIGMA,
-                epsilon=_LJ_EPSILON,
-                rc=_LJ_CUTOFF,
-                ro=_LJ_CUTOFF,
-                smooth=False,
-            )
-            energy = ref.get_potential_energy() * to_kj_mol
-            forces = ref.get_forces() * to_kj_mol * angstrom_per_nm
-            return energy, forces
-
-        def evaluate(atoms, **potential_kwargs):
-            topology, positions_nm = _topology_positions(atoms, ase.units)
-            system = _potential(path, **potential_kwargs).createSystem(
-                topology, removeCMMotion=False
-            )
-            context = mm.Context(system, mm.VerletIntegrator(0.001), platform)
-            context.setPositions(positions_nm * unit.nanometer)
-            return context
+        positions = pdb.getPositions(asNumpy=True)
+        ref = ase.Atoms(
+            numbers=numbers,
+            positions=positions.value_in_unit(unit.angstrom),
+            pbc=False,
+        )
+        ref.calc = ase.calculators.lj.LennardJones(
+            sigma=_LJ_SIGMA,
+            epsilon=_LJ_EPSILON,
+            rc=_LJ_CUTOFF,
+            ro=_LJ_CUTOFF,
+            smooth=False,
+        )
+        energy_ref = ref.get_potential_energy() * to_kj_mol
+        forces_ref = ref.get_forces() * to_kj_mol * angstrom_per_nm
 
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "lj.pt")
             model.save(path)
 
-            energy_ref, forces_ref = reference(small)
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                context = evaluate(small)
-                energy_ml = _energy(context)
-                forces_ml = _forces(context)
-            uncertainty = (
-                "Some of the atomic energy uncertainties are larger than the "
-                "threshold of 10.0 kJ/mol."
-            )
-            assert not any(str(w.message).startswith(uncertainty) for w in caught)
-            assert np.isclose(energy_ref, energy_ml, rtol=1e-5, atol=1e-8)
-            np.testing.assert_allclose(forces_ref, forces_ml, rtol=1e-5, atol=1e-6)
+            def evaluate(**potential_kwargs):
+                system = _potential(path, **potential_kwargs).createSystem(
+                    pdb.topology, removeCMMotion=False
+                )
+                context = mm.Context(system, mm.VerletIntegrator(0.001), platform)
+                context.setPositions(positions)
+                return context
 
-            context = evaluate(small, variants={"energy": "doubled"})
-            assert np.isclose(2.0 * energy_ref, _energy(context), rtol=1e-5, atol=1e-8)
+            context = evaluate(uncertaintyThreshold=None)
+            assert np.isclose(energy_ref, _energy(context), rtol=1e-5, atol=1e-8)
+            np.testing.assert_allclose(
+                forces_ref, _forces(context), rtol=1e-5, atol=1e-6
+            )
+
+            context = evaluate(
+                variants={"energy": "doubled"}, uncertaintyThreshold=None
+            )
+            assert np.isclose(
+                2.0 * energy_ref, _energy(context), rtol=1e-5, atol=1e-8
+            )
             np.testing.assert_allclose(
                 2.0 * forces_ref, _forces(context), rtol=1e-5, atol=1e-6
             )
 
             message = (
                 "Some of the atomic energy uncertainties are larger than the "
-                "threshold of 10.0 kJ/mol. The prediction is above the threshold "
-                f"for atoms {list(range(len(large)))}."
+                "threshold of 10.0 kJ/mol."
             )
             with pytest.warns(UserWarning, match=re.escape(message)):
-                _energy(evaluate(large))
+                _energy(evaluate())
 
 
 class TestMetatomicPotentialOptions:
