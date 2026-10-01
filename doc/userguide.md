@@ -355,8 +355,7 @@ When using ASE models, the following extra keyword arguments to `createSystem()`
 ### Metatomic
 
 The [metatomic](https://docs.metatensor.org/metatomic/) interface runs TorchScript
-models (`.pt` files). The full engine documentation and examples live in the
-[metatomic OpenMM engine page](https://docs.metatensor.org/metatomic/latest/engines/openmm.html).
+models (`.pt` files).
 
 The following model names are supported.
 
