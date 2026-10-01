@@ -88,6 +88,124 @@ class RequestedInputModel(HarmonicModel):
         return self._requested
 
 
+class WholeBoxEnergy(torch.nn.Module):
+    """Energy is the sum of every coordinate the model is given.
+
+    ``selected_atoms`` is ignored. A real model uses the atoms in its system,
+    including any MM atoms left inside the cutoff.
+    """
+
+    def forward(
+        self,
+        systems: List[mta.System],
+        outputs: Dict[str, mta.ModelOutput],
+        selected_atoms: Optional[Labels] = None,
+    ) -> Dict[str, TensorMap]:
+        energy = torch.zeros((len(systems), 1), dtype=systems[0].positions.dtype)
+        for i, system in enumerate(systems):
+            energy[i] += system.positions.sum()
+        return _energy_outputs(energy, outputs)
+
+
+class NeighborPairEnergy(torch.nn.Module):
+    """Sum of squared neighbor vectors. ``selected_atoms`` does not drop pairs."""
+
+    def __init__(self, cutoff):
+        super().__init__()
+        self._nl = mta.NeighborListOptions(cutoff=cutoff, full_list=True, strict=True)
+
+    def requested_neighbor_lists(self) -> List[mta.NeighborListOptions]:
+        return [self._nl]
+
+    def forward(
+        self,
+        systems: List[mta.System],
+        outputs: Dict[str, mta.ModelOutput],
+        selected_atoms: Optional[Labels] = None,
+    ) -> Dict[str, TensorMap]:
+        dtype = systems[0].positions.dtype
+        device = systems[0].positions.device
+        energy = torch.zeros((len(systems), 1), dtype=dtype, device=device)
+        for i, system in enumerate(systems):
+            neighbors = system.get_neighbor_list(self._nl)
+            disp = neighbors.values.reshape(-1, 3)
+            energy[i] += disp.pow(2).sum()
+        return _energy_outputs(energy, outputs)
+
+
+class NeighborPairForce(torch.nn.Module):
+    """Non-conservative pair forces. Output samples follow ``selected_atoms``,
+    but the values are computed from every neighbor in the system.
+    """
+
+    def __init__(self, cutoff):
+        super().__init__()
+        self._nl = mta.NeighborListOptions(cutoff=cutoff, full_list=True, strict=True)
+
+    def requested_neighbor_lists(self) -> List[mta.NeighborListOptions]:
+        return [self._nl]
+
+    def forward(
+        self,
+        systems: List[mta.System],
+        outputs: Dict[str, mta.ModelOutput],
+        selected_atoms: Optional[Labels] = None,
+    ) -> Dict[str, TensorMap]:
+        dtype = systems[0].positions.dtype
+        device = systems[0].positions.device
+        energy = torch.zeros((len(systems), 1), dtype=dtype, device=device)
+        all_forces = []
+        for system_i, system in enumerate(systems):
+            forces = torch.zeros((len(system), 3), dtype=dtype, device=device)
+            neighbors = system.get_neighbor_list(self._nl)
+            first = neighbors.samples.column("first_atom").to(torch.long)
+            second = neighbors.samples.column("second_atom").to(torch.long)
+            disp = neighbors.values.reshape(-1, 3)
+            forces.index_add_(0, first, disp)
+            forces.index_add_(0, second, -disp)
+            if selected_atoms is not None:
+                mask = selected_atoms.column("system") == system_i
+                idx = selected_atoms.column("atom")[mask].to(torch.long)
+                forces = forces[idx]
+            all_forces.append(forces)
+
+        result = _energy_outputs(energy, outputs)
+        if "non_conservative_force" not in outputs:
+            return result
+        nc = torch.cat(all_forces).reshape(-1, 3, 1)
+        if selected_atoms is None:
+            rows = []
+            for s, system in enumerate(systems):
+                n_atoms = len(system)
+                row = torch.zeros((n_atoms, 2), dtype=torch.int32, device=device)
+                row[:, 0] = s
+                row[:, 1] = torch.arange(n_atoms, device=device)
+                rows.append(row)
+            samples = Labels(["system", "atom"], torch.cat(rows))
+        else:
+            samples = selected_atoms
+        result["non_conservative_force"] = TensorMap(
+            keys=Labels("_", torch.tensor([[0]], device=device)),
+            blocks=[
+                TensorBlock(
+                    values=nc,
+                    samples=samples,
+                    components=[
+                        Labels(
+                            ["xyz"],
+                            torch.arange(3, device=device).reshape(-1, 1),
+                        )
+                    ],
+                    properties=Labels(
+                        ["non_conservative_force"],
+                        torch.tensor([[0]], device=device),
+                    ),
+                )
+            ],
+        )
+        return result
+
+
 def _export_model(path, model, atomic_types, interaction_range=0.0, outputs=None):
     if outputs is None:
         outputs = {"energy": mta.ModelOutput(unit="eV", sample_kind="system")}
@@ -157,8 +275,8 @@ class TestMetatomicPotential:
         all_numbers = [
             atom.element.atomic_number for atom in prmtop.topology.atoms()
         ]
-        # Equilibrium only for the ML subset; selected_atoms masks to those indices.
-        # atomic_types must cover the full Topology (including solvent).
+        # Equilibrium only for the ML subset. The backend shows the model that
+        # subset alone. atomic_types must cover the full Topology (including solvent).
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "harmonic-mixed.pt")
             _export_harmonic(path, positions, all_numbers)
@@ -198,13 +316,14 @@ class TestMetatomicPotential:
                 f for f in mixed_system.getForces() if isinstance(f, mm.PythonForce)
             ]
             assert python_forces
-            assert python_forces[0].usesPeriodicBoundaryConditions()
+            # The ML subset is an isolated molecule, so this force is not periodic.
+            assert not python_forces[0].usesPeriodicBoundaryConditions()
             # Empty => applies to all atoms; OpenMM returns a tuple.
             assert len(python_forces[0].getParticles()) == 0
 
     def testSelectedAtoms(self, platform_int):
-        # Same mixed system as the other backends. The harmonic energy depends
-        # only on the ML subset passed through as selected_atoms.
+        # Same mixed system as the other backends. The harmonic reference covers
+        # only the ML atoms: that is the system the model is given.
         prmtop = app.AmberPrmtopFile(
             os.path.join(test_data_dir, "toluene", "toluene-explicit.prm7")
         )
@@ -221,7 +340,7 @@ class TestMetatomicPotential:
         delta = 0.01
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "harmonic-selected.pt")
-            _export_harmonic(path, positions, numbers)
+            _export_harmonic(path, positions[ml_atoms], numbers)
             mm_system = prmtop.createSystem(nonbondedMethod=app.PME)
             mixed = _potential(path).createMixedSystem(
                 prmtop.topology, mm_system, ml_atoms, forceGroup=1
@@ -477,3 +596,274 @@ class TestMetatomicPotentialOptions:
                 mlLongRange=False,
             )
             assert mixed is not None
+
+
+def _bare_system(n_atoms, box=None):
+    topology = app.Topology()
+    chain = topology.addChain()
+    residue = topology.addResidue("MOL", chain)
+    for _ in range(n_atoms):
+        topology.addAtom("C", app.element.carbon, residue)
+    system = mm.System()
+    for _ in range(n_atoms):
+        system.addParticle(1.0)
+    if box is not None:
+        topology.setPeriodicBoxVectors(box)
+        system.setDefaultPeriodicBoxVectors(*box)
+    return topology, system
+
+
+def _direct_model(path, positions, types, selected, box, non_conservative=False):
+    """Run ``path`` the way the backend used to.
+
+    Every atom is in the metatomic system. ``selected`` only filters outputs,
+    so atoms outside that subset still contribute as environment.
+    """
+    from openmmml.models.metatomicpotential import _NL_SKIN
+
+    model = mta.load_atomistic_model(path)
+    dtype = getattr(torch, model.capabilities().dtype)
+    pos = torch.tensor(positions, dtype=dtype, requires_grad=not non_conservative)
+    types_t = torch.tensor(types, dtype=torch.int32)
+    if box is None:
+        cell = torch.zeros((3, 3), dtype=dtype)
+        pbc = torch.zeros(3, dtype=torch.bool)
+    else:
+        cell = torch.tensor(box, dtype=dtype)
+        pbc = torch.ones(3, dtype=torch.bool)
+    selected_atoms = None
+    if selected is not None:
+        selected_atoms = Labels(
+            ["system", "atom"],
+            torch.tensor([[0, i] for i in selected], dtype=torch.int32),
+        )
+    metatomic_system = mta.System(types_t, pos, cell, pbc)
+    requested = model.requested_neighbor_lists()
+    # Keep the calculators alive: copy=False stores a pointer into them.
+    neighbor_lists = []
+    if requested:
+        import vesin.metatomic
+
+        for options in requested:
+            neighbors = vesin.metatomic.NeighborList(
+                options=options,
+                length_unit="nm",
+                check_consistency=True,
+                skin=_NL_SKIN,
+            )
+            neighbors.add_neighbor_list(systems=[metatomic_system], copy=False)
+            neighbor_lists.append(neighbors)
+    outputs = {"energy": mta.ModelOutput(unit="kJ/mol", sample_kind="system")}
+    if non_conservative:
+        outputs["non_conservative_force"] = mta.ModelOutput(
+            unit="kJ/mol/nm", sample_kind="atom"
+        )
+    options = mta.ModelEvaluationOptions(
+        length_unit="nm",
+        outputs=outputs,
+        selected_atoms=selected_atoms,
+    )
+    result = model([metatomic_system], options, check_consistency=True)
+    energy = float(result["energy"].block().values.sum().detach())
+    if non_conservative:
+        block = result["non_conservative_force"].block()
+        nc = block.values.detach().reshape(-1, 3)
+        nc = nc - nc.mean(dim=0, keepdim=True)
+        atoms = block.samples.column("atom").detach().cpu().numpy()
+        forces = np.zeros((len(positions), 3), dtype=np.float64)
+        forces[atoms] = nc.cpu().numpy()
+        return energy, forces
+    result["energy"].block().values.sum().backward()
+    forces = (-metatomic_system.positions.grad).detach().cpu().numpy()
+    return energy, forces
+
+
+def _openmm_subset(path, positions, ml_atoms, platform_int, box=None, **potential_kwargs):
+    from openmmml.models.metatomicpotential import MetatomicPotentialImpl
+
+    topology, system = _bare_system(len(positions), box)
+    impl = MetatomicPotentialImpl(
+        "metatomic", path, "cpu", None, True, **potential_kwargs
+    )
+    impl.addForces(topology, system, ml_atoms, 0)
+    platform = mm.Platform.getPlatform(platform_int)
+    context = mm.Context(system, mm.VerletIntegrator(0.001), platform)
+    context.setPositions(positions * unit.nanometer)
+    python_forces = [f for f in system.getForces() if isinstance(f, mm.PythonForce)]
+    uses_pbc = python_forces[0].usesPeriodicBoundaryConditions()
+    return _energy(context), _forces(context), uses_pbc
+
+
+@pytest.mark.parametrize("platform_int", list(platform_ints))
+class TestMetatomicMixedRegion:
+    def testWholeBoxEnergyIncludesMmAtoms(self, platform_int):
+        # Two ML atoms and one MM atom. The model sums every coordinate it is
+        # given and does not look at selected_atoms.
+        positions = np.array(
+            [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.4, 0.2, 0.0]],
+            dtype=np.float64,
+        )
+        ml_atoms = [0, 1]
+        mm_atom = 2
+        types = [6, 6, 6]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "whole-box.pt")
+            _export_model(path, WholeBoxEnergy(), types)
+            old_energy, old_forces = _direct_model(
+                path, positions, types, ml_atoms, box=None
+            )
+            isolated_energy, isolated_forces = _direct_model(
+                path,
+                positions[ml_atoms],
+                [types[i] for i in ml_atoms],
+                selected=None,
+                box=None,
+            )
+            new_energy, new_forces, _ = _openmm_subset(
+                path, positions, ml_atoms, platform_int
+            )
+
+        assert not np.isclose(old_energy, isolated_energy)
+        assert np.linalg.norm(old_forces[mm_atom]) > 1.0
+        np.testing.assert_allclose(new_energy, isolated_energy, rtol=1e-5, atol=1e-8)
+        np.testing.assert_allclose(new_forces[ml_atoms], isolated_forces, rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(new_forces[mm_atom], 0.0, atol=1e-8)
+
+        moved = positions.copy()
+        moved[mm_atom, 0] += 0.3
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "whole-box.pt")
+            _export_model(path, WholeBoxEnergy(), types)
+            moved_old, _ = _direct_model(path, moved, types, ml_atoms, box=None)
+            moved_new, moved_forces, _ = _openmm_subset(
+                path, moved, ml_atoms, platform_int
+            )
+        assert not np.isclose(moved_old, old_energy)
+        np.testing.assert_allclose(moved_new, new_energy, rtol=1e-5, atol=1e-8)
+        np.testing.assert_allclose(moved_forces[mm_atom], 0.0, atol=1e-8)
+
+    def testNeighborInsideCutoff(self, platform_int):
+        # MM atom sits inside the model cutoff of both ML atoms.
+        cutoff = 0.5
+        positions = np.array(
+            [[0.0, 0.0, 0.0], [0.2, 0.0, 0.0], [0.35, 0.0, 0.0]],
+            dtype=np.float64,
+        )
+        ml_atoms = [0, 1]
+        types = [6, 6, 6]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "pairs.pt")
+            _export_model(
+                path,
+                NeighborPairEnergy(cutoff),
+                types,
+                interaction_range=cutoff,
+            )
+            old_energy, old_forces = _direct_model(
+                path, positions, types, ml_atoms, box=None
+            )
+            isolated_energy, isolated_forces = _direct_model(
+                path,
+                positions[ml_atoms],
+                [types[i] for i in ml_atoms],
+                selected=None,
+                box=None,
+            )
+            new_energy, new_forces, _ = _openmm_subset(
+                path, positions, ml_atoms, platform_int
+            )
+
+        assert old_energy > isolated_energy
+        assert np.linalg.norm(old_forces[2]) > 1.0
+        np.testing.assert_allclose(new_energy, isolated_energy, rtol=1e-5, atol=1e-8)
+        np.testing.assert_allclose(
+            new_forces[ml_atoms], isolated_forces, rtol=1e-5, atol=1e-6
+        )
+        np.testing.assert_allclose(new_forces[2], 0.0, atol=1e-8)
+
+    def testPeriodicImageOfMmAtom(self, platform_int):
+        # The MM atom is outside the cutoff in the box, and inside it across
+        # the periodic boundary. The old path counts that image; the subset
+        # path is not periodic and does not contain the MM atom.
+        cutoff = 0.3
+        positions = np.array([[0.05, 0.5, 0.5], [0.90, 0.5, 0.5]], dtype=np.float64)
+        ml_atoms = [0]
+        types = [6, 6]
+        box_vectors = [mm.Vec3(1, 0, 0), mm.Vec3(0, 1, 0), mm.Vec3(0, 0, 1)]
+        box = [v * unit.nanometer for v in box_vectors]
+        cell = np.eye(3)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "periodic.pt")
+            _export_model(
+                path,
+                NeighborPairEnergy(cutoff),
+                types,
+                interaction_range=cutoff,
+            )
+            old_energy, old_forces = _direct_model(
+                path, positions, types, ml_atoms, box=cell
+            )
+            isolated_energy, isolated_forces = _direct_model(
+                path,
+                positions[ml_atoms],
+                [types[i] for i in ml_atoms],
+                selected=None,
+                box=None,
+            )
+            new_energy, new_forces, uses_pbc = _openmm_subset(
+                path, positions, ml_atoms, platform_int, box=box
+            )
+
+        assert old_energy > 0.0
+        assert np.linalg.norm(old_forces[1]) > 1.0
+        assert isolated_energy == 0.0
+        np.testing.assert_allclose(new_energy, 0.0, atol=1e-8)
+        np.testing.assert_allclose(new_forces, 0.0, atol=1e-8)
+        np.testing.assert_allclose(isolated_forces, 0.0, atol=1e-8)
+        assert not uses_pbc
+
+    def testNonConservativeForcesStayOnTheRegion(self, platform_int):
+        cutoff = 0.5
+        positions = np.array(
+            [[0.0, 0.0, 0.0], [0.2, 0.0, 0.0], [0.35, 0.0, 0.0]],
+            dtype=np.float64,
+        )
+        ml_atoms = [0, 1]
+        types = [6, 6, 6]
+        outputs = {
+            "energy": mta.ModelOutput(unit="eV", sample_kind="system"),
+            "non_conservative_force": mta.ModelOutput(
+                unit="eV/nm", sample_kind="atom"
+            ),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "nc.pt")
+            _export_model(
+                path,
+                NeighborPairForce(cutoff),
+                types,
+                interaction_range=cutoff,
+                outputs=outputs,
+            )
+            old_energy, old_forces = _direct_model(
+                path, positions, types, ml_atoms, box=None, non_conservative=True
+            )
+            isolated_energy, isolated_forces = _direct_model(
+                path,
+                positions[ml_atoms],
+                [types[i] for i in ml_atoms],
+                selected=None,
+                box=None,
+                non_conservative=True,
+            )
+            new_energy, new_forces, _ = _openmm_subset(
+                path, positions, ml_atoms, platform_int, nonConservative=True
+            )
+
+        assert not np.allclose(old_forces[ml_atoms], isolated_forces, atol=1e-6)
+        np.testing.assert_allclose(new_energy, isolated_energy, rtol=1e-5, atol=1e-8)
+        np.testing.assert_allclose(
+            new_forces[ml_atoms], isolated_forces, rtol=1e-5, atol=1e-6
+        )
+        np.testing.assert_allclose(new_forces[2], 0.0, atol=1e-8)
+        assert np.linalg.norm(new_forces[ml_atoms]) > 1.0

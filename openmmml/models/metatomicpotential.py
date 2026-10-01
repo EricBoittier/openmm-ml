@@ -104,6 +104,11 @@ class MetatomicPotentialImpl(MLPotentialImpl):
     For periodic mixed ML/MM systems, :meth:`getMLLongRange` is inferred from the
     model's ``interaction_range`` (``True`` when infinite). Pass ``mlLongRange``
     to :meth:`~openmmml.MLPotential.createMixedSystem` to override that choice.
+
+    A subset of atoms (mechanical embedding) is evaluated on its own, as an
+    isolated non-periodic molecule. Passing that subset as ``selected_atoms``
+    would still let the model use every atom inside its cutoff, on top of the
+    force-field terms between the subset and the rest of the system.
     """
 
     def __init__(
@@ -163,7 +168,6 @@ class MetatomicPotentialImpl(MLPotentialImpl):
     ):
         try:
             import torch
-            from metatensor.torch import Labels
             from metatomic.torch import (
                 ModelEvaluationOptions,
                 ModelOutput,
@@ -229,14 +233,13 @@ class MetatomicPotentialImpl(MLPotentialImpl):
                 for options in requested_nl
             ]
 
-        selected_atoms = None
-        if atoms is not None:
-            selected_atoms = Labels(
-                ["system", "atom"],
-                torch.tensor([[0, i] for i in atoms], dtype=torch.int32),
-            )
-
+        # With a subset of atoms, the model sees only those atoms (and the link
+        # caps among them), as an isolated, non-periodic molecule.
+        region = None
         pbc = _resolve_pbc(args, topology, system, device)
+        if atoms is not None:
+            region = torch.tensor(list(atoms), dtype=torch.long, device=device)
+            pbc = torch.zeros(3, dtype=torch.bool, device=device)
         outputs = {
             energy_key: ModelOutput(unit="kJ/mol", sample_kind="system"),
         }
@@ -249,7 +252,6 @@ class MetatomicPotentialImpl(MLPotentialImpl):
         options = ModelEvaluationOptions(
             length_unit="nm",
             outputs=outputs,
-            selected_atoms=selected_atoms,
         )
 
         compute = _ComputeMetatomic(
@@ -268,6 +270,7 @@ class MetatomicPotentialImpl(MLPotentialImpl):
             check_consistency=self.checkConsistency,
             pbc=pbc,
             dtype=dtype,
+            region=region,
         )
         force = openmm.PythonForce(compute)
         force.setForceGroup(forceGroup)
@@ -420,6 +423,7 @@ class _ComputeMetatomic:
         check_consistency,
         pbc,
         dtype,
+        region=None,
     ):
         self.model = model
         self.model_path = model_path
@@ -436,6 +440,7 @@ class _ComputeMetatomic:
         self.check_consistency = check_consistency
         self.pbc = pbc
         self.dtype = dtype
+        self.region = region
 
     def __call__(self, state):
         import torch
@@ -444,6 +449,9 @@ class _ComputeMetatomic:
         positions = np.asarray(state.getPositions(asNumpy=True), dtype=np.float64)
         device = self.types.device
         pos = torch.tensor(positions, dtype=self.dtype, device=device)
+        types = self.types
+        if self.region is not None:
+            pos, types = pos[self.region], types[self.region]
         if bool(self.pbc.any()):
             cell = torch.tensor(
                 np.asarray(state.getPeriodicBoxVectors(asNumpy=True), dtype=np.float64),
@@ -458,7 +466,7 @@ class _ComputeMetatomic:
         if do_force_grad:
             pos.requires_grad_(True)
 
-        system = System(self.types, pos, cell, self.pbc)
+        system = System(types, pos, cell, self.pbc)
         for name, tensor in self.extras.items():
             system.add_data(name, tensor)
         if self.neighbor_lists:
@@ -477,6 +485,8 @@ class _ComputeMetatomic:
             above = np.flatnonzero(uncertainty > self.uncertainty_threshold)
             if len(above):
                 atoms = block.samples.column("atom").detach().cpu().numpy()
+                if self.region is not None:
+                    atoms = self.region.detach().cpu().numpy()[atoms]
                 flagged = sorted(int(i) for i in atoms[above])
                 warnings.warn(
                     "Some of the atomic energy uncertainties are larger than the "
@@ -491,6 +501,8 @@ class _ComputeMetatomic:
             nc_forces = block.values.detach().reshape(-1, 3)
             nc_forces = nc_forces - nc_forces.mean(dim=0, keepdim=True)
             atoms = block.samples.column("atom").detach().cpu().numpy()
+            if self.region is not None:
+                atoms = self.region.detach().cpu().numpy()[atoms]
             forces = np.zeros((len(self.types), 3), dtype=np.float64)
             forces[atoms] = nc_forces.cpu().numpy()
         else:
@@ -499,7 +511,13 @@ class _ComputeMetatomic:
                 raise RuntimeError(
                     "model energy does not depend on positions; cannot compute forces"
                 )
-            forces = (-grad).detach().cpu().numpy()
+            if self.region is not None:
+                forces = np.zeros((len(self.types), 3), dtype=np.float64)
+                forces[self.region.detach().cpu().numpy()] = (
+                    (-grad).detach().cpu().numpy()
+                )
+            else:
+                forces = (-grad).detach().cpu().numpy()
         return float(energy.detach()), forces
 
     def __getstate__(self):
@@ -516,6 +534,7 @@ class _ComputeMetatomic:
             "uncertainty_threshold": self.uncertainty_threshold,
             "check_consistency": self.check_consistency,
             "pbc": self.pbc.detach().cpu(),
+            "region": None if self.region is None else self.region.detach().cpu(),
             "dtype_name": str(self.dtype).removeprefix("torch."),
             "device": str(self.types.device),
         }
@@ -540,6 +559,9 @@ class _ComputeMetatomic:
         self.uncertainty_threshold = state["uncertainty_threshold"]
         self.check_consistency = state["check_consistency"]
         self.pbc = state["pbc"].to(device=device)
+        self.region = (
+            None if state["region"] is None else state["region"].to(device=device)
+        )
         self.dtype = getattr(torch, state["dtype_name"])
         self.neighbor_lists = []
         if self.nl_options:
