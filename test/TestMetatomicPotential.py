@@ -88,6 +88,28 @@ class RequestedInputModel(HarmonicModel):
         return self._requested
 
 
+class SpinAsEnergy(torch.nn.Module):
+    """Energy equals the system's spin_multiplicity, in eV."""
+
+    def requested_inputs(self) -> Dict[str, mta.ModelOutput]:
+        return {
+            "spin_multiplicity": mta.ModelOutput(unit="", sample_kind="system"),
+        }
+
+    def forward(
+        self,
+        systems: List[mta.System],
+        outputs: Dict[str, mta.ModelOutput],
+        selected_atoms: Optional[Labels] = None,
+    ) -> Dict[str, TensorMap]:
+        energy = torch.zeros((len(systems), 1), dtype=systems[0].positions.dtype)
+        for i, system in enumerate(systems):
+            spin = system.get_data("spin_multiplicity").block().values
+            # Touch positions so autograd can build forces. The energy is the spin.
+            energy[i] += spin.reshape(()) + system.positions.sum() * 0
+        return _energy_outputs(energy, outputs)
+
+
 class WholeBoxEnergy(torch.nn.Module):
     """Energy is the sum of every coordinate the model is given.
 
@@ -381,6 +403,7 @@ class TestMetatomicPotential:
             {},
             {"charge": 0, "multiplicity": 1},
             {"charge": 0, "spinMultiplicity": 1},
+            {"charge": 0, "spin_multiplicity": 1},
         ]
         platform = mm.Platform.getPlatform(platform_int)
         with tempfile.TemporaryDirectory() as tmp:
@@ -506,6 +529,26 @@ class TestMetatomicPotential:
 
 
 class TestMetatomicPotentialOptions:
+    def testSpinMultiplicity(self, harmonic_toluene):
+        pdb, numbers, positions, _ = harmonic_toluene
+        factor = float(mta.unit_conversion_factor("eV", "kJ/mol"))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "spin.pt")
+            _export_model(path, SpinAsEnergy(), numbers)
+            potential = _potential(path)
+            context = mm.Context(
+                potential.createSystem(pdb.topology),
+                mm.VerletIntegrator(0.001),
+            )
+            context.setPositions(positions * unit.nanometer)
+            assert np.isclose(_energy(context), factor, rtol=1e-5, atol=1e-8)
+            context = mm.Context(
+                potential.createSystem(pdb.topology, spin_multiplicity=3),
+                mm.VerletIntegrator(0.001),
+            )
+            context.setPositions(positions * unit.nanometer)
+            assert np.isclose(_energy(context), 3 * factor, rtol=1e-5, atol=1e-8)
+
     def testNonConservativeRequiresOutput(self, harmonic_toluene):
         pdb, _, _, model_path = harmonic_toluene
         potential = _potential(model_path, nonConservative=True)

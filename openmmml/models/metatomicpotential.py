@@ -94,8 +94,8 @@ class MetatomicPotentialImpl(MLPotentialImpl):
     Optional ``createSystem()`` / ``createMixedSystem()`` arguments:
 
     - ``charge``: total charge (default 0), used if the model requests it
-    - ``multiplicity``: spin multiplicity (default 1); ``spinMultiplicity`` is
-      accepted as an alias
+    - ``multiplicity``: spin multiplicity (default 1); ``spinMultiplicity`` and
+      ``spin_multiplicity`` are accepted as aliases
     - ``atomTypes``: integer type for each Topology atom; defaults to element
       atomic numbers when omitted
     - ``pbc``: length-3 sequence of booleans; default is all-on or all-off from
@@ -372,7 +372,7 @@ def _unsupported_input(name, sample_kind=None):
 
 
 def _spin_value(args, default):
-    for name in ("multiplicity", "spinMultiplicity"):
+    for name in ("multiplicity", "spinMultiplicity", "spin_multiplicity"):
         if name in args:
             return args[name]
     return default
