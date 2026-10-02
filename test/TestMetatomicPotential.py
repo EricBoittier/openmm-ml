@@ -112,6 +112,28 @@ class SpinAsEnergy(torch.nn.Module):
         return _energy_outputs(energy, outputs)
 
 
+class ChargeAsEnergy(torch.nn.Module):
+    """Energy equals the system's charge, in eV."""
+
+    def requested_inputs(self) -> Dict[str, mta.ModelOutput]:
+        return {
+            "charge": mta.ModelOutput(unit="e", sample_kind="system"),
+        }
+
+    def forward(
+        self,
+        systems: List[mta.System],
+        outputs: Dict[str, mta.ModelOutput],
+        selected_atoms: Optional[Labels] = None,
+    ) -> Dict[str, TensorMap]:
+        energy = torch.zeros((len(systems), 1), dtype=systems[0].positions.dtype)
+        for i, system in enumerate(systems):
+            charge = system.get_data("charge").block().values
+            # Touch positions so autograd can build forces. The energy is the charge.
+            energy[i] += charge.reshape(()) + system.positions.sum() * 0
+        return _energy_outputs(energy, outputs)
+
+
 class WholeBoxEnergy(torch.nn.Module):
     """Energy is the sum of every coordinate the model is given.
 
@@ -524,7 +546,8 @@ class TestMetatomicPotential:
 
             message = (
                 "Some of the atomic energy uncertainties are larger than the "
-                "threshold of 10.0 kJ/mol."
+                "threshold of 10.0 kJ/mol. The prediction is above the "
+                f"threshold for atoms {list(range(len(numbers)))}."
             )
             with pytest.warns(UserWarning, match=re.escape(message)):
                 _energy(evaluate())
@@ -533,23 +556,44 @@ class TestMetatomicPotential:
 class TestMetatomicPotentialOptions:
     def testSpinMultiplicity(self, harmonic_toluene):
         pdb, numbers, positions, _ = harmonic_toluene
-        factor = float(mta.unit_conversion_factor("eV", "kJ/mol"))
+        # Default is 1. multiplicity and spinMultiplicity are aliases.
+        cases = [
+            ({}, 1),
+            ({"spin_multiplicity": 3}, 3),
+            ({"multiplicity": 4}, 4),
+            ({"spinMultiplicity": 5}, 5),
+        ]
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "spin.pt")
             _export_model(path, SpinAsEnergy(), numbers)
             potential = _potential(path)
-            context = mm.Context(
-                potential.createSystem(pdb.topology),
-                mm.VerletIntegrator(0.001),
-            )
-            context.setPositions(positions * unit.nanometer)
-            assert np.isclose(_energy(context), factor, rtol=1e-5, atol=1e-8)
-            context = mm.Context(
-                potential.createSystem(pdb.topology, spin_multiplicity=3),
-                mm.VerletIntegrator(0.001),
-            )
-            context.setPositions(positions * unit.nanometer)
-            assert np.isclose(_energy(context), 3 * factor, rtol=1e-5, atol=1e-8)
+            for kwargs, spin in cases:
+                context = mm.Context(
+                    potential.createSystem(pdb.topology, **kwargs),
+                    mm.VerletIntegrator(0.001),
+                )
+                context.setPositions(positions * unit.nanometer)
+                assert np.isclose(
+                    _energy(context), spin * _EV_TO_KJ_MOL, rtol=1e-5, atol=1e-8
+                )
+
+    def testCharge(self, harmonic_toluene):
+        pdb, numbers, positions, _ = harmonic_toluene
+        # Default charge is 0. A non-default charge must change the energy.
+        cases = [({}, 0), ({"charge": 2}, 2), ({"charge": -1}, -1)]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "charge.pt")
+            _export_model(path, ChargeAsEnergy(), numbers)
+            potential = _potential(path)
+            for kwargs, charge in cases:
+                context = mm.Context(
+                    potential.createSystem(pdb.topology, **kwargs),
+                    mm.VerletIntegrator(0.001),
+                )
+                context.setPositions(positions * unit.nanometer)
+                assert np.isclose(
+                    _energy(context), charge * _EV_TO_KJ_MOL, rtol=1e-5, atol=1e-8
+                )
 
     def testNonConservativeRequiresOutput(self, harmonic_toluene):
         pdb, _, _, model_path = harmonic_toluene
@@ -579,6 +623,74 @@ class TestMetatomicPotentialOptions:
         message = "pbc must be a length-3 sequence of booleans"
         with pytest.raises(ValueError, match=re.escape(message)):
             potential.createSystem(pdb.topology, pbc=(True, False))
+
+    def testAtomTypesLength(self, harmonic_toluene):
+        pdb, _, _, model_path = harmonic_toluene
+        n_atoms = pdb.topology.getNumAtoms()
+        atom_types = [6]
+        message = (
+            f"atomTypes must have length {n_atoms} (one entry per Topology "
+            f"atom), got {len(atom_types)}"
+        )
+        with pytest.raises(ValueError, match=re.escape(message)):
+            _potential(model_path).createSystem(pdb.topology, atomTypes=atom_types)
+
+    def testAtomWithoutElement(self, harmonic_toluene):
+        _, _, _, model_path = harmonic_toluene
+        topology = app.Topology()
+        chain = topology.addChain()
+        residue = topology.addResidue("X", chain)
+        topology.addAtom("X", None, residue)
+        message = (
+            "All atoms in the Topology must have elements defined, or pass "
+            "atomTypes with an integer type for every atom."
+        )
+        with pytest.raises(ValueError, match=re.escape(message)):
+            _potential(model_path).createSystem(topology)
+
+    def testInvalidNonConservative(self, harmonic_toluene):
+        _, _, _, model_path = harmonic_toluene
+        message = (
+            "nonConservative must be one of [True, False, 'forces'], got 'stress'"
+        )
+        with pytest.raises(ValueError, match=re.escape(message)):
+            _potential(model_path, nonConservative="stress")
+
+    def testConflictingNonConservativeVariants(self, harmonic_toluene):
+        pdb, _, _, model_path = harmonic_toluene
+        warning = (
+            "variant name 'non_conservative_forces' is deprecated, please use "
+            "'non_conservative_force' instead"
+        )
+        message = (
+            "you can not specify both 'non_conservative_force' and "
+            "'non_conservative_forces' in `variants`"
+        )
+        potential = _potential(
+            model_path,
+            variants={
+                "non_conservative_force": "a",
+                "non_conservative_forces": "b",
+            },
+        )
+        with pytest.warns(UserWarning, match=re.escape(warning)):
+            with pytest.raises(ValueError, match=re.escape(message)):
+                potential.createSystem(pdb.topology)
+
+    def testDeprecatedNonConservativeVariant(self, harmonic_toluene):
+        pdb, _, positions, model_path = harmonic_toluene
+        warning = (
+            "variant name 'non_conservative_forces' is deprecated, please use "
+            "'non_conservative_force' instead"
+        )
+        potential = _potential(
+            model_path, variants={"non_conservative_forces": "forces"}
+        )
+        with pytest.warns(UserWarning, match=re.escape(warning)):
+            system = potential.createSystem(pdb.topology)
+        context = mm.Context(system, mm.VerletIntegrator(0.001))
+        context.setPositions(positions * unit.nanometer)
+        assert np.isclose(_energy(context), 0.0, atol=1e-8)
 
     def testGetMLLongRangeFromInteractionRange(self, harmonic_toluene):
         from openmmml.models.metatomicpotential import MetatomicPotentialImpl
@@ -810,3 +922,62 @@ class TestMetatomicMixedRegion:
         expected_forces[1, 0] = -2.0 * 0.2 * _EV_TO_KJ_MOL
         np.testing.assert_allclose(energy, 0.0, atol=1e-8)
         np.testing.assert_allclose(forces, expected_forces, rtol=1e-5, atol=1e-6)
+
+    def testBondAcrossTheBoundary(self, platform_int):
+        # The C–C bond is cut between the ML and MM atoms. Mechanical embedding
+        # caps it with a hydrogen. The energy is the sum of the coordinates the
+        # model is given, so it must be the ML atom plus that cap.
+        topology = app.Topology()
+        chain = topology.addChain()
+        residue = topology.addResidue("CC", chain)
+        carbon_ml = topology.addAtom("C1", app.element.carbon, residue)
+        carbon_mm = topology.addAtom("C2", app.element.carbon, residue)
+        topology.addBond(carbon_ml, carbon_mm)
+        system = mm.System()
+        system.addParticle(12.0)
+        system.addParticle(12.0)
+        ml_atom = 0
+        cap = 2
+        real = [mm.Vec3(0.1, 0.2, 0.3), mm.Vec3(0.25, 0.2, 0.3)]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "boundary.pt")
+            # The cap is a hydrogen appended to the topology.
+            _export_model(path, WholeBoxEnergy(), [6, 1])
+            mixed = _potential(path).createMixedSystem(
+                topology, system, [ml_atom], forceGroup=1
+            )
+            assert mixed.getNumParticles() == 3
+            assert mixed.isVirtualSite(cap)
+            platform = mm.Platform.getPlatform(platform_int)
+            context = mm.Context(mixed, mm.VerletIntegrator(0.001), platform)
+
+            def energy_of(real_positions):
+                context.setPositions(
+                    (list(real_positions) + [mm.Vec3(0, 0, 0)]) * unit.nanometer
+                )
+                context.computeVirtualSites()
+                coords = np.asarray(
+                    context.getState(getPositions=True)
+                    .getPositions(asNumpy=True)
+                    .value_in_unit(unit.nanometer)
+                )
+                seen = coords[ml_atom].sum() + coords[cap].sum()
+                only_ml = coords[ml_atom].sum()
+                with_partner = coords.sum()
+                assert not np.isclose(seen, only_ml)
+                assert not np.isclose(seen, with_partner)
+                energy = (
+                    context.getState(getEnergy=True, groups={1})
+                    .getPotentialEnergy()
+                    .value_in_unit(unit.kilojoules_per_mole)
+                )
+                np.testing.assert_allclose(
+                    energy, seen * _EV_TO_KJ_MOL, rtol=1e-5, atol=1e-8
+                )
+                return seen
+
+            first = energy_of(real)
+            # Off the bond axis, so the cap moves with the MM atom. The energy
+            # follows the cap and still excludes the MM atom's coordinates.
+            moved = energy_of([real[0], mm.Vec3(0.25, 0.5, 0.3)])
+            assert not np.isclose(first, moved)
