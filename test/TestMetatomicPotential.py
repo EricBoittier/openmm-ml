@@ -17,8 +17,8 @@ from openmmml import MLPotential
 platform_ints = range(mm.Platform.getNumPlatforms())
 test_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
-# Same parameters as the metatomic ASE engine's lj-test comparison.
-_LJ_CUTOFF = 5.0  # Angstrom
+# lj-test Lennard-Jones parameters. Lengths are Angstrom.
+_LJ_CUTOFF = 5.0
 _LJ_SIGMA = 1.5808
 _LJ_EPSILON = 0.1729
 # Models below declare energy in eV. The backend asks for kJ/mol.
@@ -180,8 +180,14 @@ class NeighborPairEnergy(torch.nn.Module):
 
 
 class NeighborPairForce(torch.nn.Module):
-    """Non-conservative pair forces. Output samples follow ``selected_atoms``,
-    but the values are computed from every neighbor in the system.
+    """Non-conservative forces from a full neighbor list, both ``ij`` and ``ji``.
+
+    A half list would drop one of those directions. Output samples follow
+    ``selected_atoms`` when that argument is set, and each of those atoms still
+    receives the force from every neighbor in the system it was given.
+    Link-atom caps are atoms in that system. MM atoms are not: the backend
+    evaluates the ML region on its own, so this model cannot put a force on
+    an atom it was never shown.
     """
 
     def __init__(self, cutoff):
@@ -478,15 +484,11 @@ class TestMetatomicPotential:
         assert np.isfinite(_energy(context))
 
     def testLennardJones(self, platform_int):
-        ase = pytest.importorskip("ase")
-        pytest.importorskip("vesin")
-        lj = pytest.importorskip("metatomic_lj_test")
-        import ase.calculators.lj
-        import ase.units
+        import metatomic_lj_test
 
         pdb = app.PDBFile(os.path.join(test_data_dir, "toluene", "toluene.pdb"))
         numbers = [atom.element.atomic_number for atom in pdb.topology.atoms()]
-        model = lj.lennard_jones_model(
+        model = metatomic_lj_test.lennard_jones_model(
             atomic_type=numbers[0],
             cutoff=_LJ_CUTOFF,
             sigma=_LJ_SIGMA,
@@ -497,24 +499,33 @@ class TestMetatomicPotential:
         )
         model._capabilities.atomic_types = sorted(set(numbers))
         platform = mm.Platform.getPlatform(platform_int)
-        # ASE reports eV and eV/Angstrom. OpenMM reports kJ/mol and kJ/mol/nm.
-        to_kj_mol = ase.units.mol / ase.units.kJ
-        angstrom_per_nm = ase.units.nm
         positions = pdb.getPositions(asNumpy=True)
-        ref = ase.Atoms(
-            numbers=numbers,
-            positions=positions.value_in_unit(unit.angstrom),
-            pbc=False,
+        # Shifted cutoff Lennard-Jones, the same potential lj-test implements.
+        # Positions from the PDB are nm; sigma and the cutoff are Angstrom.
+        pos = np.asarray(positions.value_in_unit(unit.angstrom), dtype=np.float64)
+        rc2 = _LJ_CUTOFF ** 2
+        e0 = 4 * _LJ_EPSILON * (
+            (_LJ_SIGMA / _LJ_CUTOFF) ** 12 - (_LJ_SIGMA / _LJ_CUTOFF) ** 6
         )
-        ref.calc = ase.calculators.lj.LennardJones(
-            sigma=_LJ_SIGMA,
-            epsilon=_LJ_EPSILON,
-            rc=_LJ_CUTOFF,
-            ro=_LJ_CUTOFF,
-            smooth=False,
-        )
-        energy_ref = ref.get_potential_energy() * to_kj_mol
-        forces_ref = ref.get_forces() * to_kj_mol * angstrom_per_nm
+        energy_ev = 0.0
+        forces_ev_a = np.zeros_like(pos)
+        for i in range(len(pos)):
+            disp = pos[i + 1:] - pos[i]
+            r2 = np.sum(disp * disp, axis=1)
+            inside = np.flatnonzero(r2 <= rc2)
+            if len(inside) == 0:
+                continue
+            disp = disp[inside]
+            r2 = r2[inside]
+            c6 = (_LJ_SIGMA ** 2 / r2) ** 3
+            c12 = c6 ** 2
+            energy_ev += np.sum(4 * _LJ_EPSILON * (c12 - c6) - e0)
+            du = -24 * _LJ_EPSILON * (2 * c12 - c6) / r2
+            pair_force = du[:, None] * disp
+            forces_ev_a[i] += pair_force.sum(axis=0)
+            forces_ev_a[inside + (i + 1)] -= pair_force
+        energy_ref = energy_ev * _EV_TO_KJ_MOL
+        forces_ref = forces_ev_a * _EV_TO_KJ_MOL * 10.0
 
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "lj.pt")
