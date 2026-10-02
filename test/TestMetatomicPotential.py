@@ -21,6 +21,8 @@ test_data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 _LJ_CUTOFF = 5.0  # Angstrom
 _LJ_SIGMA = 1.5808
 _LJ_EPSILON = 0.1729
+# Models below declare energy in eV. The backend asks for kJ/mol.
+_EV_TO_KJ_MOL = float(mta.unit_conversion_factor("eV", "kJ/mol"))
 
 
 def _energy_map(energy: torch.Tensor) -> TensorMap:
@@ -656,71 +658,6 @@ def _bare_system(n_atoms, box=None):
     return topology, system
 
 
-def _direct_model(path, positions, types, selected, box, non_conservative=False):
-    """Run ``path`` the way the backend used to.
-
-    Every atom is in the metatomic system. ``selected`` only filters outputs,
-    so atoms outside that subset still contribute as environment.
-    """
-    from openmmml.models.metatomicpotential import _NL_SKIN
-
-    model = mta.load_atomistic_model(path)
-    dtype = getattr(torch, model.capabilities().dtype)
-    pos = torch.tensor(positions, dtype=dtype, requires_grad=not non_conservative)
-    types_t = torch.tensor(types, dtype=torch.int32)
-    if box is None:
-        cell = torch.zeros((3, 3), dtype=dtype)
-        pbc = torch.zeros(3, dtype=torch.bool)
-    else:
-        cell = torch.tensor(box, dtype=dtype)
-        pbc = torch.ones(3, dtype=torch.bool)
-    selected_atoms = None
-    if selected is not None:
-        selected_atoms = Labels(
-            ["system", "atom"],
-            torch.tensor([[0, i] for i in selected], dtype=torch.int32),
-        )
-    metatomic_system = mta.System(types_t, pos, cell, pbc)
-    requested = model.requested_neighbor_lists()
-    # Keep the calculators alive: copy=False stores a pointer into them.
-    neighbor_lists = []
-    if requested:
-        import vesin.metatomic
-
-        for options in requested:
-            neighbors = vesin.metatomic.NeighborList(
-                options=options,
-                length_unit="nm",
-                check_consistency=True,
-                skin=_NL_SKIN,
-            )
-            neighbors.add_neighbor_list(systems=[metatomic_system], copy=False)
-            neighbor_lists.append(neighbors)
-    outputs = {"energy": mta.ModelOutput(unit="kJ/mol", sample_kind="system")}
-    if non_conservative:
-        outputs["non_conservative_force"] = mta.ModelOutput(
-            unit="kJ/mol/nm", sample_kind="atom"
-        )
-    options = mta.ModelEvaluationOptions(
-        length_unit="nm",
-        outputs=outputs,
-        selected_atoms=selected_atoms,
-    )
-    result = model([metatomic_system], options, check_consistency=True)
-    energy = float(result["energy"].block().values.sum().detach())
-    if non_conservative:
-        block = result["non_conservative_force"].block()
-        nc = block.values.detach().reshape(-1, 3)
-        nc = nc - nc.mean(dim=0, keepdim=True)
-        atoms = block.samples.column("atom").detach().cpu().numpy()
-        forces = np.zeros((len(positions), 3), dtype=np.float64)
-        forces[atoms] = nc.cpu().numpy()
-        return energy, forces
-    result["energy"].block().values.sum().backward()
-    forces = (-metatomic_system.positions.grad).detach().cpu().numpy()
-    return energy, forces
-
-
 def _openmm_subset(path, positions, ml_atoms, platform_int, box=None, **potential_kwargs):
     from openmmml.models.metatomicpotential import MetatomicPotentialImpl
 
@@ -739,9 +676,10 @@ def _openmm_subset(path, positions, ml_atoms, platform_int, box=None, **potentia
 
 @pytest.mark.parametrize("platform_int", list(platform_ints))
 class TestMetatomicMixedRegion:
-    def testWholeBoxEnergyIncludesMmAtoms(self, platform_int):
-        # Two ML atoms and one MM atom. The model sums every coordinate it is
-        # given and does not look at selected_atoms.
+    def testTotalEnergyIsTheMlRegionOnly(self, platform_int):
+        # The model sums every coordinate it is given. The total energy must be
+        # that sum for the ML atoms alone. Counting the MM atom as well is the
+        # double-counting bug: its interaction would also be in the force field.
         positions = np.array(
             [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.4, 0.2, 0.0]],
             dtype=np.float64,
@@ -749,40 +687,30 @@ class TestMetatomicMixedRegion:
         ml_atoms = [0, 1]
         mm_atom = 2
         types = [6, 6, 6]
+        expected = positions[ml_atoms].sum() * _EV_TO_KJ_MOL
+        double_counted = positions.sum() * _EV_TO_KJ_MOL
+        ml_force = np.full((len(ml_atoms), 3), -_EV_TO_KJ_MOL)
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "whole-box.pt")
             _export_model(path, WholeBoxEnergy(), types)
-            old_energy, old_forces = _direct_model(
-                path, positions, types, ml_atoms, box=None
-            )
-            isolated_energy, isolated_forces = _direct_model(
-                path,
-                positions[ml_atoms],
-                [types[i] for i in ml_atoms],
-                selected=None,
-                box=None,
-            )
-            new_energy, new_forces, _ = _openmm_subset(
+            energy, forces, _ = _openmm_subset(
                 path, positions, ml_atoms, platform_int
             )
 
-        assert not np.isclose(old_energy, isolated_energy)
-        assert np.linalg.norm(old_forces[mm_atom]) > 1.0
-        np.testing.assert_allclose(new_energy, isolated_energy, rtol=1e-5, atol=1e-8)
-        np.testing.assert_allclose(new_forces[ml_atoms], isolated_forces, rtol=1e-5, atol=1e-6)
-        np.testing.assert_allclose(new_forces[mm_atom], 0.0, atol=1e-8)
+        assert not np.isclose(expected, double_counted)
+        np.testing.assert_allclose(energy, expected, rtol=1e-5, atol=1e-8)
+        np.testing.assert_allclose(forces[ml_atoms], ml_force, rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(forces[mm_atom], 0.0, atol=1e-8)
 
         moved = positions.copy()
         moved[mm_atom, 0] += 0.3
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "whole-box.pt")
             _export_model(path, WholeBoxEnergy(), types)
-            moved_old, _ = _direct_model(path, moved, types, ml_atoms, box=None)
-            moved_new, moved_forces, _ = _openmm_subset(
+            moved_energy, moved_forces, _ = _openmm_subset(
                 path, moved, ml_atoms, platform_int
             )
-        assert not np.isclose(moved_old, old_energy)
-        np.testing.assert_allclose(moved_new, new_energy, rtol=1e-5, atol=1e-8)
+        np.testing.assert_allclose(moved_energy, expected, rtol=1e-5, atol=1e-8)
         np.testing.assert_allclose(moved_forces[mm_atom], 0.0, atol=1e-8)
 
     def testNeighborInsideCutoff(self, platform_int):
@@ -794,6 +722,14 @@ class TestMetatomicMixedRegion:
         )
         ml_atoms = [0, 1]
         types = [6, 6, 6]
+        # full_list emits both directions. ||r||^2 = 0.2**2 for the ML pair.
+        ml_pair = 2.0 * 0.2**2 * _EV_TO_KJ_MOL
+        # MM atom at 0.35 is inside the cutoff of both ML atoms.
+        extra = 2.0 * (0.35**2 + 0.15**2) * _EV_TO_KJ_MOL
+        # d/dr of both directions of ||r_j-r_i||^2 is 4 * separation.
+        ml_forces = np.zeros((3, 3))
+        ml_forces[0, 0] = 4.0 * 0.2 * _EV_TO_KJ_MOL
+        ml_forces[1, 0] = -4.0 * 0.2 * _EV_TO_KJ_MOL
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "pairs.pt")
             _export_model(
@@ -802,39 +738,24 @@ class TestMetatomicMixedRegion:
                 types,
                 interaction_range=cutoff,
             )
-            old_energy, old_forces = _direct_model(
-                path, positions, types, ml_atoms, box=None
-            )
-            isolated_energy, isolated_forces = _direct_model(
-                path,
-                positions[ml_atoms],
-                [types[i] for i in ml_atoms],
-                selected=None,
-                box=None,
-            )
-            new_energy, new_forces, _ = _openmm_subset(
+            energy, forces, _ = _openmm_subset(
                 path, positions, ml_atoms, platform_int
             )
 
-        assert old_energy > isolated_energy
-        assert np.linalg.norm(old_forces[2]) > 1.0
-        np.testing.assert_allclose(new_energy, isolated_energy, rtol=1e-5, atol=1e-8)
-        np.testing.assert_allclose(
-            new_forces[ml_atoms], isolated_forces, rtol=1e-5, atol=1e-6
-        )
-        np.testing.assert_allclose(new_forces[2], 0.0, atol=1e-8)
+        assert not np.isclose(ml_pair, ml_pair + extra)
+        np.testing.assert_allclose(energy, ml_pair, rtol=1e-5, atol=1e-8)
+        np.testing.assert_allclose(forces, ml_forces, rtol=1e-5, atol=1e-6)
 
     def testPeriodicImageOfMmAtom(self, platform_int):
         # The MM atom is outside the cutoff in the box, and inside it across
-        # the periodic boundary. The old path counts that image; the subset
-        # path is not periodic and does not contain the MM atom.
+        # the periodic boundary. The ML region is an isolated molecule, so
+        # that image is not part of the energy.
         cutoff = 0.3
         positions = np.array([[0.05, 0.5, 0.5], [0.90, 0.5, 0.5]], dtype=np.float64)
         ml_atoms = [0]
         types = [6, 6]
         box_vectors = [mm.Vec3(1, 0, 0), mm.Vec3(0, 1, 0), mm.Vec3(0, 0, 1)]
         box = [v * unit.nanometer for v in box_vectors]
-        cell = np.eye(3)
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "periodic.pt")
             _export_model(
@@ -843,26 +764,17 @@ class TestMetatomicMixedRegion:
                 types,
                 interaction_range=cutoff,
             )
-            old_energy, old_forces = _direct_model(
-                path, positions, types, ml_atoms, box=cell
-            )
-            isolated_energy, isolated_forces = _direct_model(
-                path,
-                positions[ml_atoms],
-                [types[i] for i in ml_atoms],
-                selected=None,
-                box=None,
-            )
-            new_energy, new_forces, uses_pbc = _openmm_subset(
+            energy, forces, uses_pbc = _openmm_subset(
                 path, positions, ml_atoms, platform_int, box=box
             )
 
-        assert old_energy > 0.0
-        assert np.linalg.norm(old_forces[1]) > 1.0
-        assert isolated_energy == 0.0
-        np.testing.assert_allclose(new_energy, 0.0, atol=1e-8)
-        np.testing.assert_allclose(new_forces, 0.0, atol=1e-8)
-        np.testing.assert_allclose(isolated_forces, 0.0, atol=1e-8)
+        # Across the boundary the MM image is inside the cutoff (0.15 nm).
+        # A periodic model that still saw that atom would report this energy.
+        image_energy = 2.0 * 0.15**2 * _EV_TO_KJ_MOL
+        assert image_energy > 0.0
+        np.testing.assert_allclose(energy, 0.0, atol=1e-8)
+        assert not np.isclose(energy, image_energy)
+        np.testing.assert_allclose(forces, 0.0, atol=1e-8)
         assert not uses_pbc
 
     def testNonConservativeForcesStayOnTheRegion(self, platform_int):
@@ -888,25 +800,13 @@ class TestMetatomicMixedRegion:
                 interaction_range=cutoff,
                 outputs=outputs,
             )
-            old_energy, old_forces = _direct_model(
-                path, positions, types, ml_atoms, box=None, non_conservative=True
-            )
-            isolated_energy, isolated_forces = _direct_model(
-                path,
-                positions[ml_atoms],
-                [types[i] for i in ml_atoms],
-                selected=None,
-                box=None,
-                non_conservative=True,
-            )
-            new_energy, new_forces, _ = _openmm_subset(
+            energy, forces, _ = _openmm_subset(
                 path, positions, ml_atoms, platform_int, nonConservative=True
             )
 
-        assert not np.allclose(old_forces[ml_atoms], isolated_forces, atol=1e-6)
-        np.testing.assert_allclose(new_energy, isolated_energy, rtol=1e-5, atol=1e-8)
-        np.testing.assert_allclose(
-            new_forces[ml_atoms], isolated_forces, rtol=1e-5, atol=1e-6
-        )
-        np.testing.assert_allclose(new_forces[2], 0.0, atol=1e-8)
-        assert np.linalg.norm(new_forces[ml_atoms]) > 1.0
+        # Both neighbor directions add the 0.2 nm separation onto the ML atoms.
+        expected_forces = np.zeros((3, 3))
+        expected_forces[0, 0] = 2.0 * 0.2 * _EV_TO_KJ_MOL
+        expected_forces[1, 0] = -2.0 * 0.2 * _EV_TO_KJ_MOL
+        np.testing.assert_allclose(energy, 0.0, atol=1e-8)
+        np.testing.assert_allclose(forces, expected_forces, rtol=1e-5, atol=1e-6)
