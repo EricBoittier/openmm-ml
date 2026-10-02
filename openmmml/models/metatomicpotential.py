@@ -30,10 +30,12 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 import math
 import warnings
-from typing import Iterable, Optional
+from collections.abc import Iterable
+from pathlib import Path
 
 import numpy as np
 import openmm
+
 from openmmml.mlpotential import MLPotentialImpl, MLPotentialImplFactory
 
 _INPUT_DEFAULTS = {"charge": (0.0, "e"), "spin_multiplicity": (1.0, "")}
@@ -48,8 +50,8 @@ class MetatomicPotentialImplFactory(MLPotentialImplFactory):
 
     def createImpl(
         self,
-        name: str,
-        modelPath: str,
+        name,
+        model,
         device=None,
         extensionsDirectory=None,
         checkConsistency: bool = False,
@@ -58,9 +60,9 @@ class MetatomicPotentialImplFactory(MLPotentialImplFactory):
         uncertaintyThreshold=_DEFAULT_UNCERTAINTY_THRESHOLD_KJ_MOL,
         **args,
     ) -> MLPotentialImpl:
+        assert name == "metatomic"
         return MetatomicPotentialImpl(
-            name,
-            modelPath,
+            model,
             device,
             extensionsDirectory,
             checkConsistency,
@@ -81,7 +83,7 @@ class MetatomicPotentialImpl(MLPotentialImpl):
 
     >>> potential = MLPotential(
     ...     "metatomic",
-    ...     modelPath="model.pt",
+    ...     model="model.pt",
     ...     device="cuda",
     ...     extensionsDirectory="./extensions",
     ...     checkConsistency=False,
@@ -113,8 +115,7 @@ class MetatomicPotentialImpl(MLPotentialImpl):
 
     def __init__(
         self,
-        name,
-        modelPath,
+        model,
         device,
         extensionsDirectory,
         checkConsistency,
@@ -127,48 +128,55 @@ class MetatomicPotentialImpl(MLPotentialImpl):
                 f"nonConservative must be one of {list(_VALID_NC)}, "
                 f"got {nonConservative!r}"
             )
-        self.name = name
-        self.modelPath = modelPath
+
+        self.model = model
         self.device = device
         self.extensionsDirectory = extensionsDirectory
         self.checkConsistency = checkConsistency
         self.nonConservative = nonConservative
         self.variants = variants
         self.uncertaintyThreshold = uncertaintyThreshold
-        self._ml_long_range = None
+        self._MLLongRange = None
 
     def getMLLongRange(self) -> bool:
         """Return whether the model includes all-image ML-ML interactions.
 
-        Uses ``capabilities.interaction_range``: infinite means long-range
-        (``True``), any finite value means short-range (``False``). Callers can
-        still pass ``mlLongRange`` to ``createMixedSystem()`` to override.
+        Uses ``capabilities.interaction_range``: infinite means long-range (``True``),
+        any finite value means short-range (``False``). Callers can still pass
+        ``mlLongRange`` to ``createMixedSystem()`` to override.
         """
-        if self._ml_long_range is None:
+        if self._MLLongRange is None:
             try:
-                from metatomic.torch import load_atomistic_model
+                from metatomic.torch import AtomisticModel, load_atomistic_model
             except ImportError as e:
                 raise ImportError(
                     "Failed to import metatomic. Install it with "
                     "'pip install metatomic-torch'."
                 ) from e
-            model = load_atomistic_model(
-                self.modelPath, extensions_directory=self.extensionsDirectory
-            )
-            self._ml_long_range = math.isinf(model.capabilities().interaction_range)
-        return self._ml_long_range
+
+            if isinstance(self.model, (str, Path)):
+                model = load_atomistic_model(
+                    self.model, extensions_directory=self.extensionsDirectory
+                )
+            else:
+                assert isinstance(self.model, AtomisticModel)
+                model = self.model
+
+            self._MLLongRange = math.isinf(model.capabilities().interaction_range)
+        return self._MLLongRange
 
     def addForces(
         self,
         topology: openmm.app.Topology,
         system: openmm.System,
-        atoms: Optional[Iterable[int]],
+        atoms: Iterable[int] | None,
         forceGroup: int,
         **args,
     ):
         try:
             import torch
             from metatomic.torch import (
+                AtomisticModel,
                 ModelEvaluationOptions,
                 ModelOutput,
                 load_atomistic_model,
@@ -184,16 +192,19 @@ class MetatomicPotentialImpl(MLPotentialImpl):
         topology_atoms = list(topology.atoms())
         types = _resolve_atom_types(topology_atoms, args.get("atomTypes"))
 
-        model = load_atomistic_model(
-            self.modelPath, extensions_directory=self.extensionsDirectory
-        )
+        if isinstance(self.model, (str, Path)):
+            model = load_atomistic_model(
+                self.model, extensions_directory=self.extensionsDirectory
+            )
+        else:
+            assert isinstance(self.model, AtomisticModel)
+            model = self.model
+
         capabilities = model.capabilities()
         allowed = set(capabilities.atomic_types)
         for atom_type in types:
             if atom_type not in allowed:
-                raise ValueError(
-                    f"this model does not support atomic type {atom_type}"
-                )
+                raise ValueError(f"this model does not support atomic type {atom_type}")
         desired = self.device
         if desired is not None and not isinstance(desired, str):
             desired = str(desired)
@@ -243,26 +254,22 @@ class MetatomicPotentialImpl(MLPotentialImpl):
         outputs = {
             energy_key: ModelOutput(unit="kJ/mol", sample_kind="system"),
         }
+
         if nc_forces_key is not None:
-            outputs[nc_forces_key] = ModelOutput(
-                unit="kJ/mol/nm", sample_kind="atom"
-            )
+            outputs[nc_forces_key] = ModelOutput(unit="kJ/mol/nm", sample_kind="atom")
         if uq_key is not None:
             outputs[uq_key] = ModelOutput(unit="kJ/mol", sample_kind="atom")
-        options = ModelEvaluationOptions(
+        evaluation_options = ModelEvaluationOptions(
             length_unit="nm",
             outputs=outputs,
         )
 
         compute = _ComputeMetatomic(
             model=model,
-            model_path=self.modelPath,
-            extensions_directory=self.extensionsDirectory,
             types=types,
             extras=extras,
             neighbor_lists=neighbor_lists,
-            nl_options=requested_nl,
-            options=options,
+            evaluation_options=evaluation_options,
             energy_key=energy_key,
             nc_forces_key=nc_forces_key,
             uq_key=uq_key,
@@ -324,11 +331,9 @@ def _resolve_output_keys(
 
     energy_key = pick_output("energy", outputs, resolved["energy"])
 
-    has_energy_uq = any("energy_uncertainty" in key for key in outputs.keys())
+    has_energy_uq = any("energy_uncertainty" in key for key in outputs)
     uq_key = (
-        pick_output(
-            "energy_uncertainty", outputs, resolved["energy_uncertainty"]
-        )
+        pick_output("energy_uncertainty", outputs, resolved["energy_uncertainty"])
         if has_energy_uq and uncertainty_threshold is not None
         else None
     )
@@ -363,36 +368,28 @@ def _resolve_pbc(args, topology, system, device):
     return torch.tensor(flags, dtype=torch.bool, device=device)
 
 
-def _unsupported_input(name, sample_kind=None):
-    kind = f" (sample_kind={sample_kind!r})" if sample_kind is not None else ""
-    return ValueError(
-        f"this model requests extra input '{name}'{kind}, which is not "
-        "implemented by MLPotential('metatomic')"
-    )
-
-
-def _spin_value(args, default):
-    for name in ("multiplicity", "spinMultiplicity", "spin_multiplicity"):
-        if name in args:
-            return args[name]
-    return default
-
-
 def _extra_inputs(requested, args, dtype, device):
     import torch
     from metatensor.torch import Labels, TensorBlock, TensorMap
 
     extras = {}
     for name, option in requested.items():
-        sample_kind = option.sample_kind
-        if name not in _INPUT_DEFAULTS or sample_kind != "system":
-            raise _unsupported_input(name, sample_kind)
+        if name not in _INPUT_DEFAULTS or option.sample_kind != "system":
+            raise ValueError(
+                f"this model requests extra input '{name}' "
+                f"(sample_kind={option.sample_kind!r}), which is not "
+                "implemented by MLPotential('metatomic')"
+            )
         default, input_unit = _INPUT_DEFAULTS[name]
-        value = (
-            _spin_value(args, default)
-            if name == "spin_multiplicity"
-            else args.get(name, default)
-        )
+
+        if name == "spin_multiplicity":
+            value = default
+            for aliases in ("multiplicity", "spinMultiplicity", "spin_multiplicity"):
+                if aliases in args:
+                    value = args[aliases]
+        else:
+            value = args.get(name, default)
+
         block = TensorBlock(
             values=torch.tensor([[float(value)]], dtype=dtype),
             samples=Labels(["system"], torch.zeros((1, 1), dtype=torch.int32)),
@@ -409,36 +406,33 @@ class _ComputeMetatomic:
     def __init__(
         self,
         model,
-        model_path,
-        extensions_directory,
         types,
+        pbc,
         extras,
         neighbor_lists,
-        nl_options,
-        options,
+        evaluation_options,
         energy_key,
         nc_forces_key,
         uq_key,
         uncertainty_threshold,
         check_consistency,
-        pbc,
         dtype,
         region=None,
     ):
         self.model = model
-        self.model_path = model_path
-        self.extensions_directory = extensions_directory
+
+        self.pbc = pbc
         self.types = types
         self.extras = extras
         self.neighbor_lists = neighbor_lists
-        self.nl_options = nl_options
-        self.options = options
+
+        self.evaluation_options = evaluation_options
         self.energy_key = energy_key
         self.nc_forces_key = nc_forces_key
         self.uq_key = uq_key
         self.uncertainty_threshold = uncertainty_threshold
         self.check_consistency = check_consistency
-        self.pbc = pbc
+
         self.dtype = dtype
         self.region = region
 
@@ -448,10 +442,11 @@ class _ComputeMetatomic:
 
         positions = np.asarray(state.getPositions(asNumpy=True), dtype=np.float64)
         device = self.types.device
-        pos = torch.tensor(positions, dtype=self.dtype, device=device)
+        positions = torch.tensor(positions, dtype=self.dtype, device=device)
         types = self.types
+
         if self.region is not None:
-            pos, types = pos[self.region], types[self.region]
+            positions, types = positions[self.region], types[self.region]
         if bool(self.pbc.any()):
             cell = torch.tensor(
                 np.asarray(state.getPeriodicBoxVectors(asNumpy=True), dtype=np.float64),
@@ -464,11 +459,12 @@ class _ComputeMetatomic:
 
         do_force_grad = self.nc_forces_key is None
         if do_force_grad:
-            pos.requires_grad_(True)
+            positions.requires_grad_(True)
 
-        system = System(types, pos, cell, self.pbc)
+        system = System(types, positions, cell, self.pbc)
         for name, tensor in self.extras.items():
             system.add_data(name, tensor)
+
         if self.neighbor_lists:
             if system.device.type not in ("cpu", "cuda"):
                 system = system.to(device="cpu")
@@ -477,16 +473,17 @@ class _ComputeMetatomic:
             if system.device != device:
                 system = system.to(device=device)
 
-        outputs = self.model([system], self.options, self.check_consistency)
-        energy = outputs[self.energy_key].block().values.sum()
+        outputs = self.model([system], self.evaluation_options, self.check_consistency)
+        energy = outputs[self.energy_key].block().values
+
         if self.uq_key is not None:
             block = outputs[self.uq_key].block()
             uncertainty = block.values.detach().cpu().numpy().reshape(-1)
             above = np.flatnonzero(uncertainty > self.uncertainty_threshold)
             if len(above):
-                atoms = block.samples.column("atom").detach().cpu().numpy()
+                atoms = block.samples.column("atom").cpu().numpy()
                 if self.region is not None:
-                    atoms = self.region.detach().cpu().numpy()[atoms]
+                    atoms = self.region.cpu().numpy()[atoms]
                 flagged = sorted(int(i) for i in atoms[above])
                 warnings.warn(
                     "Some of the atomic energy uncertainties are larger than the "
@@ -494,85 +491,28 @@ class _ComputeMetatomic:
                     f"prediction is above the threshold for atoms {flagged}.",
                     stacklevel=2,
                 )
+
         if do_force_grad:
-            energy.backward()
+            energy.backward(-torch.ones_like(energy))
+
         if self.nc_forces_key is not None:
             block = outputs[self.nc_forces_key].block()
             nc_forces = block.values.detach().reshape(-1, 3)
+            # remove the mean force to prevent drift since non-conservative forces
+            # are not guaranteed to sum to zero.
             nc_forces = nc_forces - nc_forces.mean(dim=0, keepdim=True)
             atoms = block.samples.column("atom").detach().cpu().numpy()
             if self.region is not None:
-                atoms = self.region.detach().cpu().numpy()[atoms]
+                atoms = self.region.cpu().numpy()[atoms]
             forces = np.zeros((len(self.types), 3), dtype=np.float64)
             forces[atoms] = nc_forces.cpu().numpy()
         else:
             grad = system.positions.grad
-            if grad is None:
-                raise RuntimeError(
-                    "model energy does not depend on positions; cannot compute forces"
-                )
+            assert grad is not None
+
             if self.region is not None:
                 forces = np.zeros((len(self.types), 3), dtype=np.float64)
-                forces[self.region.detach().cpu().numpy()] = (
-                    (-grad).detach().cpu().numpy()
-                )
+                forces[self.region.cpu().numpy()] = grad.cpu().numpy()
             else:
-                forces = (-grad).detach().cpu().numpy()
+                forces = grad.cpu().numpy()
         return float(energy.detach()), forces
-
-    def __getstate__(self):
-        return {
-            "model_path": self.model_path,
-            "extensions_directory": self.extensions_directory,
-            "types": self.types.detach().cpu(),
-            "extras": {k: v.to("cpu") for k, v in self.extras.items()},
-            "nl_options": self.nl_options,
-            "options": self.options,
-            "energy_key": self.energy_key,
-            "nc_forces_key": self.nc_forces_key,
-            "uq_key": self.uq_key,
-            "uncertainty_threshold": self.uncertainty_threshold,
-            "check_consistency": self.check_consistency,
-            "pbc": self.pbc.detach().cpu(),
-            "region": None if self.region is None else self.region.detach().cpu(),
-            "dtype_name": str(self.dtype).removeprefix("torch."),
-            "device": str(self.types.device),
-        }
-
-    def __setstate__(self, state):
-        import torch
-        from metatomic.torch import load_atomistic_model
-
-        device = torch.device(state["device"])
-        self.model_path = state["model_path"]
-        self.extensions_directory = state["extensions_directory"]
-        self.model = load_atomistic_model(
-            self.model_path, extensions_directory=self.extensions_directory
-        ).to(device=device)
-        self.types = state["types"].to(device=device)
-        self.extras = {k: v.to(device=device) for k, v in state["extras"].items()}
-        self.nl_options = state["nl_options"]
-        self.options = state["options"]
-        self.energy_key = state["energy_key"]
-        self.nc_forces_key = state["nc_forces_key"]
-        self.uq_key = state["uq_key"]
-        self.uncertainty_threshold = state["uncertainty_threshold"]
-        self.check_consistency = state["check_consistency"]
-        self.pbc = state["pbc"].to(device=device)
-        self.region = (
-            None if state["region"] is None else state["region"].to(device=device)
-        )
-        self.dtype = getattr(torch, state["dtype_name"])
-        self.neighbor_lists = []
-        if self.nl_options:
-            import vesin.metatomic
-
-            self.neighbor_lists = [
-                vesin.metatomic.NeighborList(
-                    options=options,
-                    length_unit="nm",
-                    check_consistency=self.check_consistency,
-                    skin=_NL_SKIN,
-                )
-                for options in self.nl_options
-            ]
