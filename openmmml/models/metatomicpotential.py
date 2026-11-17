@@ -184,7 +184,12 @@ class MetatomicPotentialImpl(MLPotentialImpl):
                 "supported for mixed ML/MM systems"
             )
         allowed = set(capabilities.atomic_types)
-        for atom_type in types:
+        # Only the ML region reaches the model: `types` is indexed by `region`
+        # before every evaluation below. Checking the whole topology rejects any
+        # mixed system whose MM part holds an element the ML model does not
+        # know, which is the ordinary case (an organic solute in water).
+        checked = types if atoms is None else [types[i] for i in atoms]
+        for atom_type in checked:
             if atom_type not in allowed:
                 raise ValueError(f"this model does not support atomic type {atom_type}")
         desired = self.device
