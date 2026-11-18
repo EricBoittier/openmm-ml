@@ -183,6 +183,11 @@ class MetatomicPotentialImpl(MLPotentialImpl):
                 "this model has an infinite interaction range, which is not "
                 "supported for mixed ML/MM systems"
             )
+        # `atoms` is typed `Iterable[int]`, and is read here and again for
+        # `region` below, so materialize it once: a caller reaching addForces()
+        # directly with a generator would otherwise find it already consumed.
+        atoms = None if atoms is None else list(atoms)
+
         allowed = set(capabilities.atomic_types)
         # Only the ML region reaches the model: `types` is indexed by `region`
         # before every evaluation below. Checking the whole topology rejects any
@@ -236,7 +241,7 @@ class MetatomicPotentialImpl(MLPotentialImpl):
         region = None
         pbc = _resolve_pbc(args, topology, system, device)
         if atoms is not None:
-            region = torch.tensor(list(atoms), dtype=torch.long, device=device)
+            region = torch.tensor(atoms, dtype=torch.long, device=device)
             pbc = torch.zeros(3, dtype=torch.bool, device=device)
         outputs = {
             energy_key: ModelOutput(unit="kJ/mol", sample_kind="system"),
