@@ -380,6 +380,48 @@ class TestMetatomicPotential:
             forces, _forces(context, groups={1}), rtol=1e-4, atol=1e-5
         )
 
+    def testMmRegionMayHoldUnsupportedTypes(self, platform):
+        """A model only has to support the ML region's elements.
+
+        Only `types[region]` is ever passed to the model, so an ML solute in MM
+        water must build even when the model does not know oxygen.
+        """
+        prmtop = app.AmberPrmtopFile(
+            os.path.join(TEST_DATA_DIR, "toluene", "toluene-explicit.prm7")
+        )
+        inpcrd = app.AmberInpcrdFile(
+            os.path.join(TEST_DATA_DIR, "toluene", "toluene-explicit.rst7")
+        )
+        ml_atoms = list(range(15))
+        positions = np.asarray(
+            inpcrd.positions.value_in_unit(unit.nanometer), dtype=np.float64
+        )
+        numbers = [atom.element.atomic_number for atom in prmtop.topology.atoms()]
+        ml_types = {numbers[i] for i in ml_atoms}
+        assert set(numbers) - ml_types, "the MM region must add an element"
+
+        model = _atomistic_model(
+            HarmonicModel(1.0, torch.tensor(positions[ml_atoms], dtype=torch.float64)),
+            sorted(ml_types),
+        )
+        potential = MLPotential("metatomic", model=model, checkConsistency=True)
+        mixed = potential.createMixedSystem(
+            prmtop.topology,
+            prmtop.createSystem(nonbondedMethod=app.PME),
+            ml_atoms,
+            forceGroup=1,
+        )
+
+        delta = 0.01
+        context = mm.Context(mixed, mm.VerletIntegrator(0.001), platform)
+        context.setPositions(positions + delta)
+        assert np.isclose(
+            len(ml_atoms) * 3 * delta**2,
+            _energy(context, groups={1}),
+            rtol=1e-5,
+            atol=1e-8,
+        )
+
     def testExtraInputs(self, platform, harmonic_toluene):
         pdb, numbers, positions, _ = harmonic_toluene
         requested = {
